@@ -3,3 +3,9 @@ bin/
 tmp/
 coverage.out
 *.log
+
+# Binaries a bare `go build ./cmd/<name>` drops in the repository root. The
+# Makefile always builds into bin/, but an ad-hoc build should not be
+# committable either.
+/worker
+/migrate

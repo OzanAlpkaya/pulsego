@@ -10,12 +10,17 @@ disable-model-invocation: true
    ```
    gofmt -l .
    go vet ./...
-   golangci-lint run
+   go tool golangci-lint run
    go test -race ./...
-   govulncheck ./...
-   go build ./cmd/api
-   go build ./cmd/worker
+   go tool govulncheck ./...
+   go build -o bin/api ./cmd/api
+   go build -o bin/worker ./cmd/worker
+   go build -o bin/migrate ./cmd/migrate
    ```
+   The linter and vulnerability scanner are pinned as go.mod `tool`
+   directives, hence `go tool`. The `-o` on the builds is required: a bare
+   `go build ./cmd/api` tries to write an executable named `api` into the
+   repository root and fails against the `api/` directory.
    If this is Sprint 5 or later, also run `docker build` against
    `deployments/Dockerfile`, and run the integration suite (Testcontainers-Go,
    requires Docker) with `make test-integration`.

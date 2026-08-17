@@ -1,0 +1,12 @@
+.git
+.github
+.claude
+bin
+tmp
+web
+*.md
+!README.md
+.env
+coverage.out
+*.log
+deployments/compose.yaml

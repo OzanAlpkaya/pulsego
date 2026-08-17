@@ -44,7 +44,7 @@ Repository layout:
 
 ```
 pulsego/
-├── cmd/{api,worker}/main.go
+├── cmd/{api,worker,migrate}/main.go
 ├── internal/{config,domain,httpapi,monitor,checker,scheduler,repository,security,telemetry}/
 ├── db/{migrations,queries}/  sqlc.yaml
 ├── api/openapi.yaml
@@ -56,6 +56,10 @@ pulsego/
 
 Interfaces live in the package that consumes them, not in a global
 `interfaces` package. Domain logic stays separate from transport/DB code.
+
+`cmd/migrate` is a one-shot job, not a service: it applies the embedded
+migrations and exits. Keeping it out of `cmd/api` and `cmd/worker` is what
+allows those to be scaled to several replicas without racing on the schema.
 
 ## 4. Non-Goals (v1)
 
@@ -204,7 +208,10 @@ Scope — **Tests, Docker, CI:**
   replica startup.
 - CI (`.github/workflows/ci.yml`): `gofmt` check, `go vet ./...`,
   `golangci-lint run`, `go test -race ./...`, `govulncheck ./...`,
-  `go build ./cmd/api`, `go build ./cmd/worker`, `docker build`.
+  `go build -o bin/api ./cmd/api`, `go build -o bin/worker ./cmd/worker`,
+  `docker build`. The `-o` is required, not cosmetic: a bare
+  `go build ./cmd/api` writes an executable named `api` into the repository
+  root, which collides with the `api/` directory holding `openapi.yaml`.
 
 **Definition of Done:**
 - [ ] SSRF test suite covers loopback/private/link-local/redirect-to-private
@@ -241,6 +248,29 @@ Scope:
 - [ ] Project-level Definition of Done (§9) fully satisfied.
 
 ---
+
+## 5a. Testing Strategy
+
+Two categories, split by build tag so the fast one always runs:
+
+**Unit** — no build tag, no Docker, must stay fast enough to run on every save.
+Covers pure logic: config loading and validation, the state machine and its
+transition table, error classification, SSRF target validation, stats maths,
+cursor encoding, and handler behaviour via `httptest`. Table-driven, parallel,
+and asserted on messages where the message *is* the feature (config errors,
+problem+json bodies).
+
+**Integration** — `//go:build integration`, run with `make test-integration`
+against Testcontainers-Go PostgreSQL. Covers everything whose correctness lives
+in the database: migrations up and down, CRUD and soft delete, concurrent
+`SKIP LOCKED` claims, lease expiry and reclaim, the single check-result
+transaction, the one-unresolved-incident constraint, cursor pagination, and the
+stats queries.
+
+Rules that hold for both: no mocking of PostgreSQL — integration tests use a
+real one; `go test -race ./...` must be green; a test asserting a database
+constraint belongs in the integration suite even when application code also
+validates the same rule, because the constraint is the guarantee.
 
 ## 6. Database Model
 

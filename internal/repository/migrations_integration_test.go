@@ -1,0 +1,255 @@
+//go:build integration
+
+// Integration tests run against a real PostgreSQL container. They are behind
+// the `integration` build tag so that `go test ./...` stays fast and works
+// without a Docker daemon; run them with `make test-integration`.
+package repository_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/OzanAlpkaya/pulsego/db"
+	"github.com/OzanAlpkaya/pulsego/internal/repository"
+)
+
+const postgresImage = "postgres:17-alpine"
+
+// startPostgres brings up a throwaway PostgreSQL instance and returns its
+// connection URL. The container is terminated when the test finishes.
+func startPostgres(t *testing.T) string {
+	t.Helper()
+
+	ctx := context.Background()
+
+	container, err := tcpostgres.Run(ctx, postgresImage,
+		tcpostgres.WithDatabase("pulsego"),
+		tcpostgres.WithUsername("pulsego"),
+		tcpostgres.WithPassword("pulsego"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(2*time.Minute),
+		),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := testcontainers.TerminateContainer(container); err != nil {
+			t.Logf("terminate postgres container: %v", err)
+		}
+	})
+
+	url, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("build connection string: %v", err)
+	}
+	return url
+}
+
+// openSQL returns a database/sql handle for goose, which does not speak pgx
+// natively.
+func openSQL(t *testing.T, url string) *sql.DB {
+	t.Helper()
+
+	connCfg, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("parse connection string: %v", err)
+	}
+
+	sqlDB := stdlib.OpenDB(*connCfg)
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Logf("close sql handle: %v", err)
+		}
+	})
+	return sqlDB
+}
+
+func migrateUp(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+
+	goose.SetBaseFS(db.Migrations)
+	if err := goose.SetDialect("postgres"); err != nil {
+		t.Fatalf("set goose dialect: %v", err)
+	}
+	if err := goose.UpContext(context.Background(), sqlDB, db.MigrationsDir); err != nil {
+		t.Fatalf("goose up: %v", err)
+	}
+}
+
+// TestMigrationsUpDown proves the schema applies and rolls back cleanly, which
+// is what makes a bad migration recoverable in a real deployment.
+func TestMigrationsUpDown(t *testing.T) {
+	url := startPostgres(t)
+	sqlDB := openSQL(t, url)
+
+	migrateUp(t, sqlDB)
+
+	var exists bool
+	err := sqlDB.QueryRowContext(t.Context(), `SELECT to_regclass('public.monitors') IS NOT NULL`).Scan(&exists)
+	if err != nil {
+		t.Fatalf("check monitors table: %v", err)
+	}
+	if !exists {
+		t.Fatal("monitors table does not exist after migrating up")
+	}
+
+	if err := goose.DownContext(context.Background(), sqlDB, db.MigrationsDir); err != nil {
+		t.Fatalf("goose down: %v", err)
+	}
+
+	if err := sqlDB.QueryRowContext(t.Context(), `SELECT to_regclass('public.monitors') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatalf("re-check monitors table: %v", err)
+	}
+	if exists {
+		t.Error("monitors table still exists after migrating down")
+	}
+}
+
+// TestMonitorsPartialIndex verifies the scheduler's hot-path index exists with
+// its soft-delete predicate. Without the predicate the index would grow with
+// every deleted monitor.
+func TestMonitorsPartialIndex(t *testing.T) {
+	url := startPostgres(t)
+	sqlDB := openSQL(t, url)
+	migrateUp(t, sqlDB)
+
+	var definition string
+	err := sqlDB.QueryRowContext(t.Context(),
+		`SELECT indexdef FROM pg_indexes WHERE tablename = 'monitors' AND indexname = 'monitors_due_idx'`,
+	).Scan(&definition)
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("monitors_due_idx does not exist")
+	}
+	if err != nil {
+		t.Fatalf("read index definition: %v", err)
+	}
+
+	for _, want := range []string{"enabled", "next_check_at", "deleted_at IS NULL"} {
+		if !strings.Contains(definition, want) {
+			t.Errorf("index definition %q is missing %q", definition, want)
+		}
+	}
+}
+
+// TestMonitorsConstraints checks that the database is the last line of defence
+// for every bound the domain package declares, so a bad write cannot land even
+// if application validation is bypassed.
+func TestMonitorsConstraints(t *testing.T) {
+	url := startPostgres(t)
+	sqlDB := openSQL(t, url)
+	migrateUp(t, sqlDB)
+
+	const insert = `
+		INSERT INTO monitors (name, url, interval_seconds, timeout_ms,
+		                      expected_status_min, expected_status_max,
+		                      failure_threshold, state, lease_owner, lease_until)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+
+	type row struct {
+		name             string
+		url              string
+		interval         int
+		timeoutMS        int
+		statusMin        int
+		statusMax        int
+		failureThreshold int
+		state            string
+		leaseOwner       *string
+		leaseUntil       *time.Time
+	}
+
+	valid := row{
+		name: "example", url: "https://example.com", interval: 60, timeoutMS: 5000,
+		statusMin: 200, statusMax: 399, failureThreshold: 3, state: "unknown",
+	}
+
+	owner := "worker-1"
+	future := time.Now().Add(time.Minute)
+
+	tests := []struct {
+		name       string
+		mutate     func(*row)
+		constraint string
+	}{
+		{name: "blank name", mutate: func(r *row) { r.name = "   " }, constraint: "monitors_name_not_blank"},
+		{name: "blank url", mutate: func(r *row) { r.url = "" }, constraint: "monitors_url_not_blank"},
+		{name: "interval too small", mutate: func(r *row) { r.interval = 1 }, constraint: "monitors_interval_range"},
+		{name: "interval too large", mutate: func(r *row) { r.interval = 90000 }, constraint: "monitors_interval_range"},
+		{name: "timeout too small", mutate: func(r *row) { r.timeoutMS = 10 }, constraint: "monitors_timeout_range"},
+		{name: "timeout too large", mutate: func(r *row) { r.timeoutMS = 120000 }, constraint: "monitors_timeout_range"},
+		{name: "status min out of range", mutate: func(r *row) { r.statusMin = 99 }, constraint: "monitors_expected_status_min_range"},
+		{name: "status max out of range", mutate: func(r *row) { r.statusMax = 600 }, constraint: "monitors_expected_status_max_range"},
+		{name: "status range inverted", mutate: func(r *row) { r.statusMin, r.statusMax = 400, 200 }, constraint: "monitors_expected_status_order"},
+		{name: "failure threshold too small", mutate: func(r *row) { r.failureThreshold = 0 }, constraint: "monitors_failure_threshold_range"},
+		{name: "failure threshold too large", mutate: func(r *row) { r.failureThreshold = 99 }, constraint: "monitors_failure_threshold_range"},
+		{name: "unknown state", mutate: func(r *row) { r.state = "flapping" }, constraint: "monitors_state_valid"},
+		{name: "lease owner without expiry", mutate: func(r *row) { r.leaseOwner = &owner }, constraint: "monitors_lease_paired"},
+		{name: "lease expiry without owner", mutate: func(r *row) { r.leaseUntil = &future }, constraint: "monitors_lease_paired"},
+	}
+
+	// The valid row must be accepted, otherwise every rejection below is
+	// meaningless.
+	if _, err := sqlDB.ExecContext(t.Context(), insert, valid.name, valid.url, valid.interval, valid.timeoutMS,
+		valid.statusMin, valid.statusMax, valid.failureThreshold, valid.state,
+		valid.leaseOwner, valid.leaseUntil); err != nil {
+		t.Fatalf("valid monitor was rejected: %v", err)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := valid
+			tt.mutate(&r)
+
+			_, err := sqlDB.ExecContext(t.Context(), insert, r.name, r.url, r.interval, r.timeoutMS,
+				r.statusMin, r.statusMax, r.failureThreshold, r.state, r.leaseOwner, r.leaseUntil)
+			if err == nil {
+				t.Fatalf("insert succeeded, want a violation of %s", tt.constraint)
+			}
+			if !strings.Contains(err.Error(), tt.constraint) {
+				t.Errorf("error = %v, want a violation of %s", err, tt.constraint)
+			}
+		})
+	}
+}
+
+// TestNewPoolConnects covers the pool helper both binaries start with.
+func TestNewPoolConnects(t *testing.T) {
+	url := startPostgres(t)
+
+	ctx := context.Background()
+	pool, err := repository.NewPool(ctx, url, 5)
+	if err != nil {
+		t.Fatalf("NewPool() returned an unexpected error: %v", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(ctx); err != nil {
+		t.Errorf("Ping() returned an unexpected error: %v", err)
+	}
+}
+
+// TestNewPoolRejectsUnreachableDatabase makes sure startup fails loudly rather
+// than serving traffic against a database that was never reachable.
+func TestNewPoolRejectsUnreachableDatabase(t *testing.T) {
+	ctx := context.Background()
+
+	// Port 1 is reserved and never listening.
+	_, err := repository.NewPool(ctx, "postgres://pulsego:pulsego@127.0.0.1:1/pulsego?sslmode=disable", 5)
+	if err == nil {
+		t.Fatal("NewPool() succeeded against an unreachable database, want an error")
+	}
+}
