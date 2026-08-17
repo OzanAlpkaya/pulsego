@@ -11,22 +11,34 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
+// RouterConfig carries what the public router needs to be built.
+type RouterConfig struct {
+	APIKey   string
+	Monitors MonitorService
+}
+
 // NewRouter builds the public API router served on HTTP_ADDR.
 //
-// Sprint 1 only establishes the middleware stack and the liveness probe. API
-// key authentication, request IDs, and problem+json errors land in Sprint 2,
-// and /readyz joins the internal router in Sprint 5.
-func NewRouter(log *slog.Logger) http.Handler {
+// Health endpoints sit outside the authenticated group: a probe must not need
+// a credential, and /healthz is what Docker and load balancers call.
+func NewRouter(cfg RouterConfig, log *slog.Logger) http.Handler {
 	r := chi.NewRouter()
 
 	// No RealIP middleware: it trusts client-supplied forwarding headers, and
 	// nothing here needs the caller's address badly enough to accept that.
+	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(RequestLogger(log))
 
 	// HEAD as well as GET: container and load-balancer probes commonly use it.
 	r.Get("/healthz", Healthz)
 	r.Head("/healthz", Healthz)
+
+	r.Route("/v1", func(v1 chi.Router) {
+		v1.Use(APIKeyAuth(cfg.APIKey, log))
+
+		v1.Mount("/monitors", NewMonitorHandler(cfg.Monitors, log).Routes())
+	})
 
 	return r
 }
@@ -40,7 +52,6 @@ func NewInternalRouter() http.Handler {
 
 	r.Use(middleware.Recoverer)
 
-	// HEAD as well as GET: container and load-balancer probes commonly use it.
 	r.Get("/healthz", Healthz)
 	r.Head("/healthz", Healthz)
 

@@ -3,7 +3,6 @@ package httpapi_test
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,15 +11,11 @@ import (
 	"github.com/OzanAlpkaya/pulsego/internal/httpapi"
 )
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewJSONHandler(io.Discard, nil))
-}
-
 func TestHealthz(t *testing.T) {
 	t.Parallel()
 
 	routers := map[string]http.Handler{
-		"public":   httpapi.NewRouter(discardLogger()),
+		"public":   newTestRouter(t, &stubService{}),
 		"internal": httpapi.NewInternalRouter(),
 	}
 
@@ -53,7 +48,7 @@ func TestUnknownRouteReturns404(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	httpapi.NewRouter(discardLogger()).
+	newTestRouter(t, &stubService{}).
 		ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/does-not-exist", nil))
 
 	if got, want := rec.Code, http.StatusNotFound; got != want {
@@ -84,7 +79,7 @@ func TestRequestLoggerUsesRoutePattern(t *testing.T) {
 			log := slog.New(slog.NewJSONHandler(&buf, nil))
 
 			rec := httptest.NewRecorder()
-			httpapi.NewRouter(log).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.path, nil))
+			httpapi.NewRouter(httpapi.RouterConfig{APIKey: testAPIKey, Monitors: &stubService{}}, log).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.path, nil))
 
 			var record map[string]any
 			if err := json.Unmarshal(buf.Bytes(), &record); err != nil {

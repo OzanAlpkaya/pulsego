@@ -17,6 +17,7 @@ import (
 
 	"github.com/OzanAlpkaya/pulsego/internal/config"
 	"github.com/OzanAlpkaya/pulsego/internal/httpapi"
+	"github.com/OzanAlpkaya/pulsego/internal/monitor"
 	"github.com/OzanAlpkaya/pulsego/internal/repository"
 	"github.com/OzanAlpkaya/pulsego/internal/telemetry"
 )
@@ -60,7 +61,17 @@ func run() error {
 
 	log.Info("database connected", slog.Int("max_conns", int(cfg.DB.MaxConns)))
 
-	public := newServer(cfg.Server.Addr, httpapi.NewRouter(log))
+	defaults, err := monitor.DefaultsFromDurations(cfg.Checks.DefaultInterval, cfg.Checks.DefaultTimeout)
+	if err != nil {
+		return fmt.Errorf("monitor defaults: %w", err)
+	}
+
+	monitors := monitor.NewService(repository.NewMonitorStore(pool), defaults)
+
+	public := newServer(cfg.Server.Addr, httpapi.NewRouter(httpapi.RouterConfig{
+		APIKey:   cfg.Server.APIKey,
+		Monitors: monitors,
+	}, log))
 	internal := newServer(cfg.Server.InternalAddr, httpapi.NewInternalRouter())
 
 	// The group returns as soon as a listener fails or a signal arrives, at

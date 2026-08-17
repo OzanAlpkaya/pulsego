@@ -10,11 +10,11 @@ workers claim due monitors with `FOR UPDATE SKIP LOCKED` and hold time-bounded
 leases, so several workers can run without double-processing and a crashed
 worker's monitors become reclaimable on their own.
 
-> **Status: Sprint 1 of 6 complete.** The foundation — configuration, logging,
-> both binaries, the `monitors` schema, and the Compose stack — is in place. The
-> monitor API (Sprint 2), scheduler and checker (Sprint 3), incidents (Sprint 4),
+> **Status: Sprint 2 of 6 complete.** The foundation and the monitor CRUD API
+> are in place. The scheduler and checker (Sprint 3), incidents (Sprint 4),
 > SSRF protection and observability (Sprint 5), and the dashboard plus the full
-> README (Sprint 6) are still to come. See `ROADMAP.md` and `PROGRESS.md`.
+> README (Sprint 6) are still to come — so monitors can be registered, but
+> nothing checks them yet. See `ROADMAP.md` and `PROGRESS.md`.
 
 ## Quick start
 
@@ -40,6 +40,63 @@ make migrate-up
 make run-api              # in one shell
 make run-worker           # in another
 ```
+
+## API
+
+Every `/v1` endpoint needs the API key; `/healthz` deliberately does not. The
+full contract is `api/openapi.yaml`, and a test walks the router against that
+document so the two cannot drift apart.
+
+```bash
+KEY=local-development-api-key
+
+# Create — only name and url are required
+curl -X POST localhost:8080/v1/monitors -H "Authorization: Bearer $KEY" \
+  -d '{"name":"Example","url":"https://example.com"}'
+
+# List, newest first; page with the returned cursor
+curl "localhost:8080/v1/monitors?limit=20" -H "Authorization: Bearer $KEY"
+curl "localhost:8080/v1/monitors?limit=20&cursor=<next_cursor>" -H "Authorization: Bearer $KEY"
+
+curl localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY"
+
+# Partial update — omitted fields are left alone
+curl -X PATCH localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY" \
+  -d '{"enabled":false}'
+
+# Soft delete
+curl -X DELETE localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY"
+```
+
+Errors are RFC 7807 documents. Validation failures list every rejected field at
+once, so fixing a monitor definition takes one round trip:
+
+```json
+{
+  "type": "urn:pulsego:problem:validation-error",
+  "title": "Validation Failed",
+  "status": 422,
+  "request_id": "0da153fed4bb/zeGoxyFs1O-000006",
+  "errors": [
+    { "field": "name", "message": "is required" },
+    { "field": "url", "message": "must use the http or https scheme" }
+  ]
+}
+```
+
+`400` means the request could not be parsed (bad JSON, unknown field, bad UUID
+or cursor); `422` means it parsed but a field is invalid. The `request_id`
+matches the server log record for the same failure.
+
+Two behaviours worth knowing:
+
+- **Delete is soft.** The row is kept with a `deleted_at` timestamp so historical
+  check results stay meaningful, but the monitor disappears from every read
+  endpoint and is no longer scheduled. Deleting twice returns `404`.
+- **Shortening an interval pulls the next check forward** — but only when the
+  scheduled time would otherwise fall outside the new interval, so editing a
+  monitor never delays a check that is already due, and a bulk edit does not
+  make everything due at once.
 
 ## Configuration
 

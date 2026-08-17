@@ -3,7 +3,11 @@
 // same definitions can be shared by the API, the worker, and the tests.
 package domain
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // State is the availability state of a monitor as derived from its recent
 // check results. The set of values is mirrored by a CHECK constraint on
@@ -45,11 +49,19 @@ func (s State) String() string { return string(s) }
 // here without changing the migration only moves the rejection from the
 // application to the database.
 const (
-	MinCheckInterval = 10 * time.Second
-	MaxCheckInterval = 24 * time.Hour
+	// The seconds and milliseconds forms are the authoritative ones: they are
+	// the units the monitors columns store, so nothing has to convert a
+	// duration at a validation boundary.
+	MinCheckIntervalSeconds int32 = 10
+	MaxCheckIntervalSeconds int32 = 24 * 60 * 60
+	MinCheckTimeoutMS       int32 = 100
+	MaxCheckTimeoutMS       int32 = 60 * 1000
 
-	MinCheckTimeout = 100 * time.Millisecond
-	MaxCheckTimeout = 60 * time.Second
+	MinCheckInterval = time.Duration(MinCheckIntervalSeconds) * time.Second
+	MaxCheckInterval = time.Duration(MaxCheckIntervalSeconds) * time.Second
+
+	MinCheckTimeout = time.Duration(MinCheckTimeoutMS) * time.Millisecond
+	MaxCheckTimeout = time.Duration(MaxCheckTimeoutMS) * time.Millisecond
 
 	MinFailureThreshold = 1
 	MaxFailureThreshold = 10
@@ -58,6 +70,7 @@ const (
 	MaxStatusCode = 599
 
 	MaxNameLength = 120
+	MaxURLLength  = 2048
 )
 
 // Defaults applied to a monitor when the caller does not specify a value.
@@ -73,7 +86,7 @@ const (
 // to decide when to check it next. Nullable database columns are pointers so
 // that "never checked" is distinguishable from a zero value.
 type Monitor struct {
-	ID   string
+	ID   uuid.UUID
 	Name string
 	URL  string
 

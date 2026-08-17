@@ -1,0 +1,433 @@
+openapi: 3.1.0
+
+info:
+  title: PulseGo API
+  version: "1.0.0"
+  description: |
+    Uptime monitoring API. Register HTTP/HTTPS endpoints as monitors; background
+    workers check them on a schedule and record availability and latency.
+
+    All `/v1` endpoints require a bearer API key. The health endpoint is
+    deliberately unauthenticated so that probes need no credential.
+
+    Errors are returned as `application/problem+json` (RFC 7807). Every error
+    carries a `request_id` that matches the server log record for the failure.
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: monitors
+    description: Monitor definitions
+  - name: health
+    description: Liveness
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: |
+        Reports that the process is running. Performs no database query, so an
+        unreachable database does not make a healthy process look dead.
+        Readiness, which does verify PostgreSQL, arrives in Sprint 5.
+      security: []
+      operationId: getHealthz
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+
+  /v1/monitors:
+    post:
+      tags: [monitors]
+      summary: Create a monitor
+      operationId: createMonitor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateMonitorRequest"
+      responses:
+        "201":
+          description: The monitor was created.
+          headers:
+            Location:
+              description: Path of the created monitor.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Monitor"
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+    get:
+      tags: [monitors]
+      summary: List monitors
+      description: |
+        Returns one page of monitors, newest first. Soft-deleted monitors are
+        never included.
+
+        Pagination is keyset-based: pass the `next_cursor` from a response as
+        the `cursor` of the following request. The cursor is opaque — do not
+        construct or parse it. An absent `next_cursor` means the last page.
+      operationId: listMonitors
+      parameters:
+        - name: limit
+          in: query
+          description: Page size.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque cursor from a previous response's `next_cursor`.
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of monitors.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Monitor"
+                  next_cursor:
+                    type: string
+                    description: Omitted on the last page.
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/monitors/{monitorID}:
+    parameters:
+      - name: monitorID
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [monitors]
+      summary: Fetch a monitor
+      operationId: getMonitor
+      responses:
+        "200":
+          description: The monitor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Monitor"
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      tags: [monitors]
+      summary: Update a monitor
+      description: |
+        Partial update. Omitted fields are left unchanged; there is no way to
+        unset a field, because none of them are nullable. At least one field
+        must be present.
+
+        Shortening `interval_seconds` pulls the next check forward when the
+        currently scheduled time would fall outside the new interval.
+      operationId: updateMonitor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMonitorRequest"
+      responses:
+        "200":
+          description: The updated monitor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Monitor"
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+    delete:
+      tags: [monitors]
+      summary: Delete a monitor
+      description: |
+        Soft delete: the row is retained with a `deleted_at` timestamp so that
+        historical check results stay meaningful, but the monitor is no longer
+        scheduled and is absent from every read endpoint. Deleting an
+        already-deleted monitor returns 404.
+      operationId: deleteMonitor
+      responses:
+        "204":
+          description: The monitor was deleted.
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The value of the API_KEY environment variable.
+
+  responses:
+    Unauthorized:
+      description: The API key is missing or wrong.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: No such monitor.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Malformed:
+      description: The request could not be parsed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationFailed:
+      description: The body parsed but one or more fields are invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem document.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: Stable identifier for the kind of problem.
+          examples: ["urn:pulsego:problem:validation-error"]
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        request_id:
+          type: string
+          description: Matches the server log record for this failure.
+        errors:
+          type: array
+          description: Present on validation failures; one entry per rejected field.
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+    Monitor:
+      type: object
+      required:
+        - id
+        - name
+        - url
+        - interval_seconds
+        - timeout_ms
+        - expected_status_min
+        - expected_status_max
+        - failure_threshold
+        - enabled
+        - state
+        - consecutive_failures
+        - next_check_at
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 120
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        interval_seconds:
+          type: integer
+          minimum: 10
+          maximum: 86400
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 60000
+        expected_status_min:
+          type: integer
+          minimum: 100
+          maximum: 599
+        expected_status_max:
+          type: integer
+          minimum: 100
+          maximum: 599
+        failure_threshold:
+          type: integer
+          minimum: 1
+          maximum: 10
+        enabled:
+          type: boolean
+        state:
+          type: string
+          enum: [unknown, up, degraded, down]
+          description: |
+            `unknown` until the first check. `degraded` means at least one
+            failure has occurred but `failure_threshold` has not been reached.
+        consecutive_failures:
+          type: integer
+        last_checked_at:
+          type: [string, "null"]
+          format: date-time
+        last_status_code:
+          type: [integer, "null"]
+        last_latency_ms:
+          type: [integer, "null"]
+        next_check_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateMonitorRequest:
+      type: object
+      additionalProperties: false
+      required: [name, url]
+      description: |
+        Omitted optional fields fall back to the deployment defaults
+        (`DEFAULT_CHECK_INTERVAL`, `DEFAULT_CHECK_TIMEOUT`) or to the documented
+        defaults below. Unknown fields are rejected rather than ignored.
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: |
+            Must use http or https, must not embed credentials, and must not
+            include a fragment. Whether the target address is safe to contact is
+            enforced separately at check time.
+        interval_seconds:
+          type: integer
+          minimum: 10
+          maximum: 86400
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 60000
+          description: Must be less than `interval_seconds`, so checks cannot overlap.
+        expected_status_min:
+          type: integer
+          minimum: 100
+          maximum: 599
+          default: 200
+        expected_status_max:
+          type: integer
+          minimum: 100
+          maximum: 599
+          default: 399
+        failure_threshold:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 3
+        enabled:
+          type: boolean
+          default: true
+
+    UpdateMonitorRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Every field is optional; at least one must be present.
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        interval_seconds:
+          type: integer
+          minimum: 10
+          maximum: 86400
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 60000
+        expected_status_min:
+          type: integer
+          minimum: 100
+          maximum: 599
+        expected_status_max:
+          type: integer
+          minimum: 100
+          maximum: 599
+        failure_threshold:
+          type: integer
+          minimum: 1
+          maximum: 10
+        enabled:
+          type: boolean

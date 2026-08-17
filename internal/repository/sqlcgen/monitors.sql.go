@@ -7,20 +7,79 @@ package sqlcgen
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
 
-const getMonitor = `-- name: GetMonitor :one
+const createMonitor = `-- name: CreateMonitor :one
+INSERT INTO monitors (
+    name, url, interval_seconds, timeout_ms,
+    expected_status_min, expected_status_max, failure_threshold, enabled,
+    next_check_at
+) VALUES (
+    $1, $2, $3, $4,
+    $5, $6, $7, $8,
+    now()
+)
+RETURNING id, name, url, interval_seconds, timeout_ms, expected_status_min, expected_status_max, failure_threshold, enabled, state, consecutive_failures, last_checked_at, last_status_code, last_latency_ms, next_check_at, lease_owner, lease_until, created_at, updated_at, deleted_at
+`
 
+type CreateMonitorParams struct {
+	Name              string
+	Url               string
+	IntervalSeconds   int32
+	TimeoutMs         int32
+	ExpectedStatusMin int16
+	ExpectedStatusMax int16
+	FailureThreshold  int16
+	Enabled           bool
+}
+
+func (q *Queries) CreateMonitor(ctx context.Context, arg CreateMonitorParams) (Monitor, error) {
+	row := q.db.QueryRow(ctx, createMonitor,
+		arg.Name,
+		arg.Url,
+		arg.IntervalSeconds,
+		arg.TimeoutMs,
+		arg.ExpectedStatusMin,
+		arg.ExpectedStatusMax,
+		arg.FailureThreshold,
+		arg.Enabled,
+	)
+	var i Monitor
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Url,
+		&i.IntervalSeconds,
+		&i.TimeoutMs,
+		&i.ExpectedStatusMin,
+		&i.ExpectedStatusMax,
+		&i.FailureThreshold,
+		&i.Enabled,
+		&i.State,
+		&i.ConsecutiveFailures,
+		&i.LastCheckedAt,
+		&i.LastStatusCode,
+		&i.LastLatencyMs,
+		&i.NextCheckAt,
+		&i.LeaseOwner,
+		&i.LeaseUntil,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const getMonitor = `-- name: GetMonitor :one
 SELECT id, name, url, interval_seconds, timeout_ms, expected_status_min, expected_status_max, failure_threshold, enabled, state, consecutive_failures, last_checked_at, last_status_code, last_latency_ms, next_check_at, lease_owner, lease_until, created_at, updated_at, deleted_at
 FROM monitors
 WHERE id = $1
   AND deleted_at IS NULL
 `
 
-// Sprint 1 keeps this file to the two read paths needed to prove the sqlc
-// pipeline end to end. The full CRUD surface arrives in Sprint 2.
 func (q *Queries) GetMonitor(ctx context.Context, id uuid.UUID) (Monitor, error) {
 	row := q.db.QueryRow(ctx, getMonitor, id)
 	var i Monitor
@@ -53,17 +112,31 @@ const listMonitors = `-- name: ListMonitors :many
 SELECT id, name, url, interval_seconds, timeout_ms, expected_status_min, expected_status_max, failure_threshold, enabled, state, consecutive_failures, last_checked_at, last_status_code, last_latency_ms, next_check_at, lease_owner, lease_until, created_at, updated_at, deleted_at
 FROM monitors
 WHERE deleted_at IS NULL
+  AND (
+      $1::timestamptz IS NULL
+      OR (created_at, id) < (
+          $1::timestamptz,
+          $2::uuid
+      )
+  )
 ORDER BY created_at DESC, id DESC
-LIMIT $1 OFFSET $2
+LIMIT $3
 `
 
 type ListMonitorsParams struct {
-	Limit  int32
-	Offset int32
+	CursorCreatedAt *time.Time
+	CursorID        uuid.UUID
+	PageLimit       int32
 }
 
+// Keyset pagination over (created_at, id). The row-value comparison is what
+// makes the page boundary stable when several monitors share a created_at;
+// OFFSET would skip or repeat rows as the table changes underneath.
+// The two cursor parameters are always supplied together, so only the
+// timestamp needs to be nullable; cursor_id is ignored (passed as the zero
+// UUID) on the first page, where the IS NULL branch already matches.
 func (q *Queries) ListMonitors(ctx context.Context, arg ListMonitorsParams) ([]Monitor, error) {
-	rows, err := q.db.Query(ctx, listMonitors, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, listMonitors, arg.CursorCreatedAt, arg.CursorID, arg.PageLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -101,4 +174,98 @@ func (q *Queries) ListMonitors(ctx context.Context, arg ListMonitorsParams) ([]M
 		return nil, err
 	}
 	return items, nil
+}
+
+const softDeleteMonitor = `-- name: SoftDeleteMonitor :one
+UPDATE monitors
+SET deleted_at  = now(),
+    updated_at  = now(),
+    lease_owner = NULL,
+    lease_until = NULL
+WHERE id = $1
+  AND deleted_at IS NULL
+RETURNING id
+`
+
+// Soft delete. The lease is cleared so a worker that is mid-cycle cannot keep
+// treating the monitor as its own.
+func (q *Queries) SoftDeleteMonitor(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, softDeleteMonitor, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const updateMonitor = `-- name: UpdateMonitor :one
+UPDATE monitors
+SET name                = COALESCE($1, name),
+    url                 = COALESCE($2, url),
+    interval_seconds    = COALESCE($3, interval_seconds),
+    timeout_ms          = COALESCE($4, timeout_ms),
+    expected_status_min = COALESCE($5, expected_status_min),
+    expected_status_max = COALESCE($6, expected_status_max),
+    failure_threshold   = COALESCE($7, failure_threshold),
+    enabled             = COALESCE($8, enabled),
+    next_check_at       = LEAST(
+        next_check_at,
+        now() + make_interval(secs => COALESCE($3, interval_seconds))
+    ),
+    updated_at          = now()
+WHERE id = $9
+  AND deleted_at IS NULL
+RETURNING id, name, url, interval_seconds, timeout_ms, expected_status_min, expected_status_max, failure_threshold, enabled, state, consecutive_failures, last_checked_at, last_status_code, last_latency_ms, next_check_at, lease_owner, lease_until, created_at, updated_at, deleted_at
+`
+
+type UpdateMonitorParams struct {
+	Name              *string
+	Url               *string
+	IntervalSeconds   *int32
+	TimeoutMs         *int32
+	ExpectedStatusMin *int16
+	ExpectedStatusMax *int16
+	FailureThreshold  *int16
+	Enabled           *bool
+	ID                uuid.UUID
+}
+
+// Partial update: every field falls back to its current value when the caller
+// omitted it. next_check_at is pulled in only when it would otherwise sit
+// further out than the (possibly shortened) interval allows, so a tightened
+// schedule takes effect without making every edited monitor due at once.
+func (q *Queries) UpdateMonitor(ctx context.Context, arg UpdateMonitorParams) (Monitor, error) {
+	row := q.db.QueryRow(ctx, updateMonitor,
+		arg.Name,
+		arg.Url,
+		arg.IntervalSeconds,
+		arg.TimeoutMs,
+		arg.ExpectedStatusMin,
+		arg.ExpectedStatusMax,
+		arg.FailureThreshold,
+		arg.Enabled,
+		arg.ID,
+	)
+	var i Monitor
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Url,
+		&i.IntervalSeconds,
+		&i.TimeoutMs,
+		&i.ExpectedStatusMin,
+		&i.ExpectedStatusMax,
+		&i.FailureThreshold,
+		&i.Enabled,
+		&i.State,
+		&i.ConsecutiveFailures,
+		&i.LastCheckedAt,
+		&i.LastStatusCode,
+		&i.LastLatencyMs,
+		&i.NextCheckAt,
+		&i.LeaseOwner,
+		&i.LeaseUntil,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
 }

@@ -13,8 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -59,25 +57,6 @@ func startPostgres(t *testing.T) string {
 	return url
 }
 
-// openSQL returns a database/sql handle for goose, which does not speak pgx
-// natively.
-func openSQL(t *testing.T, url string) *sql.DB {
-	t.Helper()
-
-	connCfg, err := pgx.ParseConfig(url)
-	if err != nil {
-		t.Fatalf("parse connection string: %v", err)
-	}
-
-	sqlDB := stdlib.OpenDB(*connCfg)
-	t.Cleanup(func() {
-		if err := sqlDB.Close(); err != nil {
-			t.Logf("close sql handle: %v", err)
-		}
-	})
-	return sqlDB
-}
-
 func migrateUp(t *testing.T, sqlDB *sql.DB) {
 	t.Helper()
 
@@ -107,7 +86,9 @@ func TestMigrationsUpDown(t *testing.T) {
 		t.Fatal("monitors table does not exist after migrating up")
 	}
 
-	if err := goose.DownContext(context.Background(), sqlDB, db.MigrationsDir); err != nil {
+	// DownTo(0) unwinds every migration, not just the most recent one, which is
+	// what proves the whole schema is reversible.
+	if err := goose.DownToContext(context.Background(), sqlDB, db.MigrationsDir, 0); err != nil {
 		t.Fatalf("goose down: %v", err)
 	}
 

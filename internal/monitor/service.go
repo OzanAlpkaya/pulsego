@@ -1,0 +1,216 @@
+// Package monitor holds the monitor service layer: validation of user-supplied
+// monitor definitions, and the orchestration between transport and storage.
+// The state machine that turns check results into up/degraded/down transitions
+// joins it in Sprint 4.
+package monitor
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/OzanAlpkaya/pulsego/internal/domain"
+)
+
+// Pagination bounds for List.
+const (
+	DefaultPageSize = 20
+	MaxPageSize     = 100
+)
+
+// Defaults fill in the fields a caller omitted when creating a monitor. They
+// come from configuration (DEFAULT_CHECK_INTERVAL, DEFAULT_CHECK_TIMEOUT) so
+// that an operator can set the house style for a deployment.
+type Defaults struct {
+	IntervalSeconds int32
+	TimeoutMS       int32
+}
+
+// Service implements the monitor use cases.
+type Service struct {
+	store    Store
+	defaults Defaults
+}
+
+// NewService wires a service to its store.
+func NewService(store Store, defaults Defaults) *Service {
+	return &Service{store: store, defaults: defaults}
+}
+
+// CreateInput is a create request. Pointer fields are optional and fall back to
+// the configured defaults.
+type CreateInput struct {
+	Name              string
+	URL               string
+	IntervalSeconds   *int32
+	TimeoutMS         *int32
+	ExpectedStatusMin *int16
+	ExpectedStatusMax *int16
+	FailureThreshold  *int16
+	Enabled           *bool
+}
+
+// UpdateInput is a partial update. A nil pointer means "leave unchanged"; there
+// is no way to unset a field, because none of them are nullable.
+type UpdateInput struct {
+	Name              *string
+	URL               *string
+	IntervalSeconds   *int32
+	TimeoutMS         *int32
+	ExpectedStatusMin *int16
+	ExpectedStatusMax *int16
+	FailureThreshold  *int16
+	Enabled           *bool
+}
+
+// IsEmpty reports whether the update would change nothing.
+func (in UpdateInput) IsEmpty() bool {
+	return in.Name == nil && in.URL == nil && in.IntervalSeconds == nil &&
+		in.TimeoutMS == nil && in.ExpectedStatusMin == nil && in.ExpectedStatusMax == nil &&
+		in.FailureThreshold == nil && in.Enabled == nil
+}
+
+// Create validates the input, applies defaults, and stores a new monitor.
+func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Monitor, error) {
+	attrs := attributes{
+		name:              in.Name,
+		rawURL:            in.URL,
+		intervalSeconds:   deref(in.IntervalSeconds, s.defaults.IntervalSeconds),
+		timeoutMS:         deref(in.TimeoutMS, s.defaults.TimeoutMS),
+		expectedStatusMin: deref(in.ExpectedStatusMin, domain.DefaultExpectedStatusMin),
+		expectedStatusMax: deref(in.ExpectedStatusMax, domain.DefaultExpectedStatusMax),
+		failureThreshold:  deref(in.FailureThreshold, domain.DefaultFailureThreshold),
+	}
+
+	if err := attrs.validate(); err != nil {
+		return domain.Monitor{}, err
+	}
+
+	return s.store.Create(ctx, CreateParams{
+		Name:              trimmed(in.Name),
+		URL:               trimmed(in.URL),
+		IntervalSeconds:   attrs.intervalSeconds,
+		TimeoutMS:         attrs.timeoutMS,
+		ExpectedStatusMin: attrs.expectedStatusMin,
+		ExpectedStatusMax: attrs.expectedStatusMax,
+		FailureThreshold:  attrs.failureThreshold,
+		Enabled:           deref(in.Enabled, true),
+	})
+}
+
+// Get returns a single monitor, or domain.ErrNotFound if it is absent or
+// soft-deleted.
+func (s *Service) Get(ctx context.Context, id uuid.UUID) (domain.Monitor, error) {
+	return s.store.Get(ctx, id)
+}
+
+// List returns one page of monitors along with the cursor for the next page,
+// which is nil once the last page has been returned.
+func (s *Service) List(ctx context.Context, limit int32, cursor *Cursor) ([]domain.Monitor, *Cursor, error) {
+	switch {
+	case limit <= 0:
+		limit = DefaultPageSize
+	case limit > MaxPageSize:
+		limit = MaxPageSize
+	}
+
+	// One extra row answers "is there another page?" without a second query.
+	monitors, err := s.store.List(ctx, ListParams{Limit: limit + 1, Cursor: cursor})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(monitors) <= int(limit) {
+		return monitors, nil, nil
+	}
+
+	monitors = monitors[:limit]
+	last := monitors[len(monitors)-1]
+	return monitors, &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}, nil
+}
+
+// Update merges the requested changes over the stored monitor and validates the
+// result. Reading first is what lets a partial update be checked against the
+// cross-field rules: shortening an interval can invalidate a timeout that was
+// perfectly legal before.
+func (s *Service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (domain.Monitor, error) {
+	current, err := s.store.Get(ctx, id)
+	if err != nil {
+		return domain.Monitor{}, err
+	}
+
+	attrs := attributes{
+		name:              deref(in.Name, current.Name),
+		rawURL:            deref(in.URL, current.URL),
+		intervalSeconds:   deref(in.IntervalSeconds, current.IntervalSeconds),
+		timeoutMS:         deref(in.TimeoutMS, current.TimeoutMS),
+		expectedStatusMin: deref(in.ExpectedStatusMin, current.ExpectedStatusMin),
+		expectedStatusMax: deref(in.ExpectedStatusMax, current.ExpectedStatusMax),
+		failureThreshold:  deref(in.FailureThreshold, current.FailureThreshold),
+	}
+
+	if err := attrs.validate(); err != nil {
+		return domain.Monitor{}, err
+	}
+
+	params := UpdateParams{
+		ID:                id,
+		IntervalSeconds:   in.IntervalSeconds,
+		TimeoutMS:         in.TimeoutMS,
+		ExpectedStatusMin: in.ExpectedStatusMin,
+		ExpectedStatusMax: in.ExpectedStatusMax,
+		FailureThreshold:  in.FailureThreshold,
+		Enabled:           in.Enabled,
+	}
+	// Strings are stored trimmed, so re-derive them from the validated values
+	// rather than passing the raw request through.
+	if in.Name != nil {
+		name := trimmed(*in.Name)
+		params.Name = &name
+	}
+	if in.URL != nil {
+		target := trimmed(*in.URL)
+		params.URL = &target
+	}
+
+	return s.store.Update(ctx, params)
+}
+
+// Delete soft-deletes a monitor. Deleting an already-deleted monitor returns
+// domain.ErrNotFound: from the caller's point of view it was already gone.
+func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	return s.store.SoftDelete(ctx, id)
+}
+
+// DefaultsFromDurations converts configured durations into the units the
+// monitors table stores, rejecting values the columns could not hold. The
+// configuration package already enforces the same bounds; this is what keeps
+// the service usable from anywhere else without that guarantee.
+func DefaultsFromDurations(interval, timeout time.Duration) (Defaults, error) {
+	if interval < domain.MinCheckInterval || interval > domain.MaxCheckInterval {
+		return Defaults{}, fmt.Errorf("default check interval out of range: %s", interval)
+	}
+	if timeout < domain.MinCheckTimeout || timeout > domain.MaxCheckTimeout {
+		return Defaults{}, fmt.Errorf("default check timeout out of range: %s", timeout)
+	}
+
+	// The range checks above bound both values well inside int32.
+	return Defaults{
+		IntervalSeconds: int32(interval / time.Second),     // #nosec G115 -- bounded above
+		TimeoutMS:       int32(timeout / time.Millisecond), // #nosec G115 -- bounded above
+	}, nil
+}
+
+func deref[T any](p *T, fallback T) T {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+func trimmed(s string) string {
+	return strings.TrimSpace(s)
+}

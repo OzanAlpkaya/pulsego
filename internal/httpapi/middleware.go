@@ -26,6 +26,7 @@ func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 				slog.Int("status", ww.Status()),
 				slog.Int("bytes", ww.BytesWritten()),
 				slog.Duration("duration", time.Since(started)),
+				slog.String("request_id", middleware.GetReqID(r.Context())),
 			)
 		})
 	}

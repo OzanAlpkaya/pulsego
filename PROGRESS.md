@@ -1,7 +1,7 @@
 # PulseGo — Progress
 
 Last updated: 2026-08-17
-Current sprint: **Sprint 2 — Monitor API** (not started)
+Current sprint: **Sprint 3 — Scheduler and Checker** (not started)
 
 ---
 
@@ -61,17 +61,66 @@ Notes:
 ---
 
 ## Sprint 2 — Monitor API
-Status: **Not Started**
+Status: **Done** (2026-08-17, awaiting squash-merge approval)
 Branch: `feature/sprint-02-monitor-api`
 
 Definition of Done:
-- [ ] All 5 CRUD endpoints implemented and tested, including soft-delete
-- [ ] Invalid input returns problem+json with correct fields
-- [ ] API key required and constant-time compared; health endpoints exempt
-- [ ] OpenAPI doc matches implemented endpoints
+- [x] All 5 CRUD endpoints implemented and tested, including soft-delete
+- [x] Invalid input returns problem+json with correct fields
+- [x] API key required and constant-time compared; health endpoints exempt
+- [x] OpenAPI doc matches implemented endpoints
 
 Notes:
--
+- Decisions taken at sprint start (D1–D7 of the approved plan):
+  - **Cursor pagination** for `GET /v1/monitors`, keyed on
+    `(created_at DESC, id DESC)`, sharing one `cursor.go` with Sprint 3's check
+    history rather than shipping two pagination styles.
+  - **422** for well-formed bodies that fail field validation, **400** for
+    unparseable ones (bad JSON, unknown field, bad UUID or cursor).
+  - Shortening an interval sets
+    `next_check_at = LEAST(next_check_at, now() + new_interval)`, so a tightened
+    schedule applies promptly but an unrelated edit never delays a due check.
+  - API key compared as **SHA-256 digests**, because
+    `subtle.ConstantTimeCompare` returns early on a length mismatch and would
+    otherwise leak the configured key's length.
+  - Sprint 2 validates URL **syntax only** (scheme, host, no credentials, no
+    fragment, length). Address-range and DNS checks stay in Sprint 5's
+    `internal/security`; doing them in a handler would be slow and a TOCTOU trap.
+  - Problem `type` values are **URNs**, not URLs to docs that do not exist.
+  - **No uniqueness constraint on url** — monitoring one URL twice with
+    different intervals is legitimate.
+- Sprint 1 had already delivered the full constraint set and the partial index
+  (decision D2 of that sprint), so this sprint's only migration is `00002`,
+  adding `monitors_url_length` — the one configurable field that still had no
+  bound.
+- `TestOpenAPIMatchesRouter` walks the live chi router and compares it with
+  `api/openapi.yaml`. It is what makes the "OpenAPI doc matches implemented
+  endpoints" item enforced rather than merely asserted: adding a route without
+  documenting it now fails the build.
+- Integration tests moved to a **single shared PostgreSQL container** via
+  `TestMain`, with truncation between tests. One container per test would have
+  meant roughly five minutes for this suite; it now runs in about 30 seconds.
+- Two defects caught by the gate: `goose.Down` only reverses one migration, so
+  the Sprint 1 down-migration test silently stopped proving anything once a
+  second migration existed (now `DownTo(0)`); and gosec flagged five integer
+  conversions, four of which were fixed properly by giving `internal/domain`
+  int32 constants in the units the columns actually store.
+- Evidence recorded at close-out (2026-08-17), all against commit `7762e92`:
+  - **CRUD + soft delete:** exercised against the running Compose stack —
+    `POST` 201 with `Location`, `GET` 200, `PATCH` 200 leaving untouched fields
+    alone, `DELETE` 204. After deletion `GET` and a second `DELETE` both return
+    404, while PostgreSQL still holds the row: 6 rows total, 5 live.
+    12 integration tests cover the same ground plus lease clearing and keyset
+    pagination over rows sharing a `created_at`.
+  - **problem+json:** a live invalid create returned 422 with
+    `content-type: application/problem+json` and all five rejected fields in one
+    `errors` array, alongside `type`, `title`, `status`, `detail`, `request_id`.
+  - **API key:** 10 rejection cases pass, including a wrong key of exactly the
+    same length; `/healthz` answers 200 with no credential, and a separate test
+    asserts no `/v1` route reaches the service unauthenticated.
+  - **OpenAPI parity:** `TestOpenAPIMatchesRouter` compares 6 documented
+    operations against 6 walked from the live chi router; confirmed non-vacuous
+    by printing both sets.
 
 ---
 
