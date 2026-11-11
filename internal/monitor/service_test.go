@@ -27,6 +27,13 @@ type fakeStore struct {
 	listChecksParams *monitor.ListChecksParams
 	requestedID      *uuid.UUID
 
+	incidents           []domain.Incident
+	listIncidentsParams *monitor.ListIncidentsParams
+
+	rawStats       domain.RawStats
+	statsMonitorID uuid.UUID
+	statsWindow    domain.StatsWindow
+
 	err error
 }
 
@@ -100,6 +107,25 @@ func (f *fakeStore) ListChecks(_ context.Context, p monitor.ListChecksParams) ([
 		return f.checks[:p.Limit], nil
 	}
 	return f.checks, nil
+}
+
+func (f *fakeStore) ListIncidents(_ context.Context, p monitor.ListIncidentsParams) ([]domain.Incident, error) {
+	f.listIncidentsParams = &p
+	if f.err != nil {
+		return nil, f.err
+	}
+	if int(p.Limit) < len(f.incidents) {
+		return f.incidents[:p.Limit], nil
+	}
+	return f.incidents, nil
+}
+
+func (f *fakeStore) GetStats(_ context.Context, monitorID uuid.UUID, window domain.StatsWindow) (domain.RawStats, error) {
+	f.statsMonitorID, f.statsWindow = monitorID, window
+	if f.err != nil {
+		return domain.RawStats{}, f.err
+	}
+	return f.rawStats, nil
 }
 
 func testDefaults() monitor.Defaults {

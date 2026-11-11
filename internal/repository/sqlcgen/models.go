@@ -10,6 +10,17 @@ import (
 	"github.com/google/uuid"
 )
 
+type Incident struct {
+	ID             uuid.UUID
+	MonitorID      uuid.UUID
+	StartedAt      time.Time
+	ResolvedAt     *time.Time
+	OpeningCheckID *int64
+	ClosingCheckID *int64
+	Cause          *string
+	CreatedAt      time.Time
+}
+
 type Monitor struct {
 	ID                  uuid.UUID
 	Name                string

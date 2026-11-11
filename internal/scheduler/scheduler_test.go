@@ -43,6 +43,8 @@ type fakeStore struct {
 	// writeCtxErrs collects ctx.Err() seen by Record and Release.
 	writeCtxErrs []error
 	recordErr    error
+	// change is what every successful Record returns.
+	change domain.StateChange
 }
 
 func newFakeStore(supply int) *fakeStore {
@@ -76,12 +78,15 @@ func (f *fakeStore) Claim(_ context.Context, workerID string, batchSize int32, _
 	return out, nil
 }
 
-func (f *fakeStore) Record(ctx context.Context, _ string, id uuid.UUID, _ time.Time, _ domain.CheckOutcome) error {
+func (f *fakeStore) Record(ctx context.Context, _ string, id uuid.UUID, _ time.Time, _ domain.CheckOutcome) (domain.StateChange, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.writeCtxErrs = append(f.writeCtxErrs, ctx.Err())
 	f.records = append(f.records, id)
-	return f.recordErr
+	if f.recordErr != nil {
+		return domain.StateChange{}, f.recordErr
+	}
+	return f.change, nil
 }
 
 func (f *fakeStore) Release(ctx context.Context, _ string, id uuid.UUID) error {
@@ -435,4 +440,88 @@ func (f *flakyStore) Claim(ctx context.Context, workerID string, batchSize int32
 		return nil, errors.New("database unreachable")
 	}
 	return f.fakeStore.Claim(ctx, workerID, batchSize, lease)
+}
+
+// recordOnce runs the scheduler until one result with the given change is
+// recorded and returns the log entries.
+func recordOnce(t *testing.T, change domain.StateChange) []map[string]any {
+	t.Helper()
+	store := newFakeStore(1)
+	store.change = change
+	chk := newGateChecker()
+	h := start(t, store, chk, 1, 1, testShutdown)
+
+	waitFor(t, "a running check", func() bool { return chk.running.Load() == 1 })
+	chk.gate <- struct{}{}
+	waitFor(t, "the result recorded", func() bool { return store.snapshot().records == 1 })
+	h.stop(t)
+	return h.logs.entries(t)
+}
+
+func TestStateChangeIsLogged(t *testing.T) {
+	entries := recordOnce(t, domain.StateChange{
+		From:                domain.StateDegraded,
+		To:                  domain.StateDown,
+		ConsecutiveFailures: 3,
+		Incident:            domain.IncidentOpen,
+	})
+
+	var logged int
+	for _, e := range entries {
+		if e["level"] == "WARN" || e["level"] == "ERROR" {
+			t.Errorf("unexpected %s log: %v", e["level"], e)
+		}
+		if e["msg"] != "monitor state changed" {
+			continue
+		}
+		logged++
+		if e["level"] != "INFO" {
+			t.Errorf("state change logged at %v, want INFO", e["level"])
+		}
+		if _, ok := e["monitor_id"]; !ok {
+			t.Errorf("state change log has no monitor_id: %v", e)
+		}
+		if e["from"] != "degraded" || e["to"] != "down" || e["incident"] != "open" {
+			t.Errorf("state change log = %v; want from=degraded to=down incident=open", e)
+		}
+	}
+	if logged != 1 {
+		t.Fatalf("%d state change logs, want 1", logged)
+	}
+}
+
+func TestSelfLoopIsNotLoggedAsStateChange(t *testing.T) {
+	entries := recordOnce(t, domain.StateChange{
+		From:                domain.StateDown,
+		To:                  domain.StateDown,
+		ConsecutiveFailures: 7,
+	})
+	for _, e := range entries {
+		if e["msg"] == "monitor state changed" {
+			t.Fatalf("self-loop logged as a state change: %v", e)
+		}
+	}
+}
+
+func TestIncidentAlreadyOpenIsWarned(t *testing.T) {
+	entries := recordOnce(t, domain.StateChange{
+		From:                domain.StateDegraded,
+		To:                  domain.StateDown,
+		ConsecutiveFailures: 3,
+		Incident:            domain.IncidentOpen,
+		IncidentAlreadyOpen: true,
+	})
+
+	var warned bool
+	for _, e := range entries {
+		if e["level"] == "WARN" && e["msg"] == "incident already open, none opened" {
+			warned = true
+			if _, ok := e["monitor_id"]; !ok {
+				t.Errorf("warn log has no monitor_id: %v", e)
+			}
+		}
+	}
+	if !warned {
+		t.Fatal("no warn log for the already-open incident")
+	}
 }

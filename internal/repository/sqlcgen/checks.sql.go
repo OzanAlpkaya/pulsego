@@ -12,6 +12,47 @@ import (
 	"github.com/google/uuid"
 )
 
+const applyCheckResult = `-- name: ApplyCheckResult :exec
+UPDATE monitors
+SET state                = $1,
+    consecutive_failures = $2,
+    last_checked_at      = now(),
+    last_status_code     = $3,
+    last_latency_ms      = $4::int,
+    next_check_at        = CASE
+        WHEN next_check_at = $5::timestamptz
+            THEN now() + make_interval(secs => interval_seconds)
+        ELSE next_check_at  -- a manual request arrived mid-check; keep it
+    END,
+    lease_owner = NULL,
+    lease_until = NULL
+WHERE id = $6
+`
+
+type ApplyCheckResultParams struct {
+	State               string
+	ConsecutiveFailures int32
+	StatusCode          *int32
+	LatencyMs           int32
+	ClaimedNextCheckAt  time.Time
+	MonitorID           uuid.UUID
+}
+
+// Step 5: applies the transition and releases the lease. next_check_at is
+// rescheduled from completion unless a manual request moved it while the
+// check was running. updated_at is left alone: it tracks edits, not results.
+func (q *Queries) ApplyCheckResult(ctx context.Context, arg ApplyCheckResultParams) error {
+	_, err := q.db.Exec(ctx, applyCheckResult,
+		arg.State,
+		arg.ConsecutiveFailures,
+		arg.StatusCode,
+		arg.LatencyMs,
+		arg.ClaimedNextCheckAt,
+		arg.MonitorID,
+	)
+	return err
+}
+
 const claimDueMonitors = `-- name: ClaimDueMonitors :many
 WITH due AS (
     SELECT id
@@ -88,6 +129,68 @@ func (q *Queries) ClaimDueMonitors(ctx context.Context, arg ClaimDueMonitorsPara
 	return items, nil
 }
 
+const deleteExpiredChecks = `-- name: DeleteExpiredChecks :execrows
+DELETE FROM monitor_checks
+WHERE id IN (
+    SELECT id FROM monitor_checks
+    WHERE checked_at < now() - make_interval(days => $1::int)
+    ORDER BY checked_at
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+`
+
+type DeleteExpiredChecksParams struct {
+	RetentionDays int32
+	BatchSize     int32
+}
+
+// Retention (Sprint 4 D8): deletes up to batch_size checks older than the
+// retention period, oldest first. SKIP LOCKED lets several workers run it at
+// once; incidents referencing a deleted check keep their row with the
+// reference set to NULL.
+func (q *Queries) DeleteExpiredChecks(ctx context.Context, arg DeleteExpiredChecksParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredChecks, arg.RetentionDays, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const insertCheck = `-- name: InsertCheck :one
+INSERT INTO monitor_checks (monitor_id, success, status_code, latency_ms,
+                            error_kind, error_message, checked_at)
+VALUES ($1, $2, $3,
+        $4, $5, $6,
+        now())
+RETURNING id
+`
+
+type InsertCheckParams struct {
+	MonitorID    uuid.UUID
+	Success      bool
+	StatusCode   *int32
+	LatencyMs    int32
+	ErrorKind    *string
+	ErrorMessage *string
+}
+
+// Step 4: stores the check row. checked_at is the transaction's now(), so it
+// equals last_checked_at and any incident timestamp written alongside it.
+func (q *Queries) InsertCheck(ctx context.Context, arg InsertCheckParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertCheck,
+		arg.MonitorID,
+		arg.Success,
+		arg.StatusCode,
+		arg.LatencyMs,
+		arg.ErrorKind,
+		arg.ErrorMessage,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const listChecks = `-- name: ListChecks :many
 SELECT id, monitor_id, success, status_code, latency_ms, error_kind, error_message, checked_at FROM monitor_checks
 WHERE monitor_id = $1
@@ -142,66 +245,50 @@ func (q *Queries) ListChecks(ctx context.Context, arg ListChecksParams) ([]Monit
 	return items, nil
 }
 
-const recordCheckResult = `-- name: RecordCheckResult :one
-WITH released AS (
-    UPDATE monitors
-    SET last_checked_at  = now(),
-        last_status_code = $2,
-        last_latency_ms  = $3,
-        next_check_at    = CASE
-            WHEN next_check_at = $6::timestamptz
-                THEN now() + make_interval(secs => interval_seconds)
-            ELSE next_check_at  -- a manual request arrived mid-check; keep it
-        END,
-        lease_owner = NULL,
-        lease_until = NULL
-    -- Qualified: sqlc (not PostgreSQL) reports a bare "id" here as ambiguous
-    -- with monitor_checks.id from the outer INSERT.
-    WHERE monitors.id = $7
-      AND lease_owner = $8
-      AND deleted_at IS NULL
-    RETURNING id
-)
-INSERT INTO monitor_checks (monitor_id, success, status_code, latency_ms,
-                            error_kind, error_message, checked_at)
-SELECT id, $1::boolean, $2::int,
-       $3::int, $4::varchar,
-       $5::text, now()
-FROM released
-RETURNING id
+const lockLeasedMonitor = `-- name: LockLeasedMonitor :one
+SELECT id, name, url, interval_seconds, timeout_ms, expected_status_min, expected_status_max, failure_threshold, enabled, state, consecutive_failures, last_checked_at, last_status_code, last_latency_ms, next_check_at, lease_owner, lease_until, created_at, updated_at, deleted_at FROM monitors
+WHERE id = $1
+  AND lease_owner = $2
+  AND deleted_at IS NULL
+FOR UPDATE
 `
 
-type RecordCheckResultParams struct {
-	Success            bool
-	StatusCode         *int32
-	LatencyMs          int32
-	ErrorKind          *string
-	ErrorMessage       *string
-	ClaimedNextCheckAt time.Time
-	MonitorID          uuid.UUID
-	WorkerID           *string
+type LockLeasedMonitorParams struct {
+	MonitorID uuid.UUID
+	WorkerID  *string
 }
 
-// Records a check result and releases the lease atomically. The insert only
-// happens if the lease update matched, so no row returned means the lease was
-// lost (expired and reclaimed, or the monitor was soft-deleted) and the late
-// result must be discarded. next_check_at is rescheduled from completion
-// unless a manual request moved it while the check was running.
-// Explicit casts: sqlc cannot infer parameter types in a SELECT list.
-func (q *Queries) RecordCheckResult(ctx context.Context, arg RecordCheckResultParams) (int64, error) {
-	row := q.db.QueryRow(ctx, recordCheckResult,
-		arg.Success,
-		arg.StatusCode,
-		arg.LatencyMs,
-		arg.ErrorKind,
-		arg.ErrorMessage,
-		arg.ClaimedNextCheckAt,
-		arg.MonitorID,
-		arg.WorkerID,
+// Step 2 of the check-result transaction (Sprint 4 D3): locks the monitor row
+// for the rest of the transaction, but only while workerID still holds the
+// lease. No row means the lease was lost (expired and reclaimed, or the
+// monitor was soft-deleted) and the late result must be discarded. Holding
+// this lock until commit is what serializes results for one monitor.
+func (q *Queries) LockLeasedMonitor(ctx context.Context, arg LockLeasedMonitorParams) (Monitor, error) {
+	row := q.db.QueryRow(ctx, lockLeasedMonitor, arg.MonitorID, arg.WorkerID)
+	var i Monitor
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Url,
+		&i.IntervalSeconds,
+		&i.TimeoutMs,
+		&i.ExpectedStatusMin,
+		&i.ExpectedStatusMax,
+		&i.FailureThreshold,
+		&i.Enabled,
+		&i.State,
+		&i.ConsecutiveFailures,
+		&i.LastCheckedAt,
+		&i.LastStatusCode,
+		&i.LastLatencyMs,
+		&i.NextCheckAt,
+		&i.LeaseOwner,
+		&i.LeaseUntil,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
 	)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
+	return i, err
 }
 
 const releaseLease = `-- name: ReleaseLease :execrows

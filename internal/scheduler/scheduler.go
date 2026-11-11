@@ -25,10 +25,13 @@ type Store interface {
 	// Claim leases up to batchSize due monitors to workerID. Each returned
 	// monitor's NextCheckAt is the claimed value Record needs.
 	Claim(ctx context.Context, workerID string, batchSize int32, lease time.Duration) ([]domain.Monitor, error)
-	// Record stores a check result and releases the lease. It returns
-	// ErrLeaseLost if workerID no longer holds the lease.
+	// Record stores a check result, applies the state transition, opens or
+	// resolves an incident, and releases the lease, atomically. It returns
+	// the applied change, with IncidentAlreadyOpen set if an incident should
+	// have been opened but one already was. It returns ErrLeaseLost if
+	// workerID no longer holds the lease.
 	Record(ctx context.Context, workerID string, monitorID uuid.UUID,
-		claimedNextCheckAt time.Time, outcome domain.CheckOutcome) error
+		claimedNextCheckAt time.Time, outcome domain.CheckOutcome) (domain.StateChange, error)
 	// Release gives a lease back without a result; the monitor stays due.
 	Release(ctx context.Context, workerID string, monitorID uuid.UUID) error
 }
@@ -234,7 +237,7 @@ func (s *Scheduler) check(ctx, checkCtx context.Context, m domain.Monitor) {
 		return
 	}
 
-	err := s.store.Record(writeCtx, s.cfg.WorkerID, m.ID, m.NextCheckAt, outcome)
+	change, err := s.store.Record(writeCtx, s.cfg.WorkerID, m.ID, m.NextCheckAt, outcome)
 	switch {
 	case errors.Is(err, ErrLeaseLost):
 		log.Warn("lease lost, check result discarded")
@@ -252,5 +255,16 @@ func (s *Scheduler) check(ctx, checkCtx context.Context, m domain.Monitor) {
 			attrs = append(attrs, slog.String("error_kind", outcome.ErrorKind.String()))
 		}
 		log.Debug("check recorded", attrs...)
+		if change.From != change.To {
+			log.Info("monitor state changed",
+				slog.String("from", string(change.From)),
+				slog.String("to", string(change.To)),
+				slog.String("incident", change.Incident.String()))
+		}
+		if change.IncidentAlreadyOpen {
+			log.Warn("incident already open, none opened",
+				slog.String("from", string(change.From)),
+				slog.String("to", string(change.To)))
+		}
 	}
 }

@@ -32,6 +32,8 @@ type MonitorService interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	RequestCheck(ctx context.Context, id uuid.UUID) (domain.Monitor, error)
 	ListChecks(ctx context.Context, id uuid.UUID, limit int32, cursor *monitor.CheckCursor) ([]domain.Check, *monitor.CheckCursor, error)
+	ListIncidents(ctx context.Context, id uuid.UUID, limit int32, cursor *monitor.IncidentCursor) ([]domain.Incident, *monitor.IncidentCursor, error)
+	Stats(ctx context.Context, id uuid.UUID, window domain.StatsWindow) (domain.Stats, error)
 }
 
 // MonitorHandler serves the /v1/monitors resource.
@@ -56,6 +58,8 @@ func (h *MonitorHandler) Routes() chi.Router {
 	r.Delete("/{monitorID}", h.delete)
 	r.Post("/{monitorID}/checks", h.requestCheck)
 	r.Get("/{monitorID}/checks", h.listChecks)
+	r.Get("/{monitorID}/incidents", h.listIncidents)
+	r.Get("/{monitorID}/stats", h.stats)
 
 	return r
 }

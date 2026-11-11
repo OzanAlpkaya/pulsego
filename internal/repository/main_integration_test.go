@@ -188,12 +188,12 @@ func migrateURL(url string) error {
 	return nil
 }
 
-// truncateMonitors gives a test empty monitors and monitor_checks tables. Tests using the shared pool run
+// truncateMonitors gives a test empty monitors, monitor_checks and incidents tables. Tests using the shared pool run
 // serially for this reason.
 func truncateMonitors(t *testing.T) {
 	t.Helper()
 
-	if _, err := sharedPool.Exec(t.Context(), "TRUNCATE monitor_checks, monitors"); err != nil {
+	if _, err := sharedPool.Exec(t.Context(), "TRUNCATE incidents, monitor_checks, monitors"); err != nil {
 		t.Fatalf("truncating monitors failed: %v", err)
 	}
 }

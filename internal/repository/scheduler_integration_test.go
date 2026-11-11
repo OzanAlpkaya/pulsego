@@ -340,7 +340,7 @@ func TestExpiredLeaseReclaimedByDifferentWorker(t *testing.T) {
 		t.Fatalf("lease_owner = %v after reclaim, want worker-b", got.owner)
 	}
 
-	err = store.Record(t.Context(), "worker-a", id, claimedA[0].NextCheckAt, successOutcome())
+	_, err = store.Record(t.Context(), "worker-a", id, claimedA[0].NextCheckAt, successOutcome())
 	if !errors.Is(err, scheduler.ErrLeaseLost) {
 		t.Errorf("A's late Record() returned %v, want scheduler.ErrLeaseLost", err)
 	}
@@ -351,7 +351,7 @@ func TestExpiredLeaseReclaimedByDifferentWorker(t *testing.T) {
 		t.Errorf("lease_owner = %v after A's late Record, want B's lease untouched", got.owner)
 	}
 
-	if err := store.Record(t.Context(), "worker-b", id, claimedB[0].NextCheckAt, successOutcome()); err != nil {
+	if _, err := store.Record(t.Context(), "worker-b", id, claimedB[0].NextCheckAt, successOutcome()); err != nil {
 		t.Fatalf("B: Record() returned an unexpected error: %v", err)
 	}
 	if n := countChecks(t, id); n != 1 {
@@ -511,7 +511,7 @@ func TestRecordCheckResult(t *testing.T) {
 			}
 
 			before := dbNow(t)
-			if err := store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, tt.outcome); err != nil {
+			if _, err := store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, tt.outcome); err != nil {
 				t.Fatalf("Record() returned an unexpected error: %v", err)
 			}
 			after := dbNow(t)
@@ -606,7 +606,7 @@ func TestRecordPreservesManualRequestDuringCheck(t *testing.T) {
 		t.Fatal("the manual request did not change next_check_at; the test proves nothing")
 	}
 
-	if err := store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, successOutcome()); err != nil {
+	if _, err := store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, successOutcome()); err != nil {
 		t.Fatalf("Record() returned an unexpected error: %v", err)
 	}
 
@@ -636,7 +636,7 @@ func TestRecordOnDeletedMonitorLosesLease(t *testing.T) {
 		t.Fatalf("SoftDelete() returned an unexpected error: %v", err)
 	}
 
-	err = store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, successOutcome())
+	_, err = store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, successOutcome())
 	if !errors.Is(err, scheduler.ErrLeaseLost) {
 		t.Errorf("Record() on a deleted monitor returned %v, want scheduler.ErrLeaseLost", err)
 	}
@@ -675,7 +675,7 @@ func TestReleaseLease(t *testing.T) {
 	if err := store.Release(t.Context(), "worker-a", id); !errors.Is(err, scheduler.ErrLeaseLost) {
 		t.Errorf("a second Release() returned %v, want scheduler.ErrLeaseLost", err)
 	}
-	if err := store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, successOutcome()); !errors.Is(err, scheduler.ErrLeaseLost) {
+	if _, err := store.Record(t.Context(), "worker-a", id, claimed[0].NextCheckAt, successOutcome()); !errors.Is(err, scheduler.ErrLeaseLost) {
 		t.Errorf("Record() after release returned %v, want scheduler.ErrLeaseLost", err)
 	}
 

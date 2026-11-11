@@ -125,9 +125,10 @@ func TestOpenAPIMatchesRouter(t *testing.T) {
 	documented := documentedOperations(t, doc)
 	implemented := implementedOperations(t)
 
-	// healthz, the five monitor operations, and the two check operations. A
-	// change here is a change to the API surface and should be deliberate.
-	if got, want := len(implemented), 8; got != want {
+	// healthz, the five monitor operations, the two check operations, the
+	// incident history, and the stats. A change here is a change to the API
+	// surface and should be deliberate.
+	if got, want := len(implemented), 10; got != want {
 		t.Errorf("router implements %d operations, want %d: %v", got, want, implemented)
 	}
 
@@ -221,7 +222,8 @@ func TestUnauthenticatedRequestsNeverReachTheService(t *testing.T) {
 			t.Errorf("%s: status = %d, want 401", op, rec.Code)
 		}
 		if svc.createInput != nil || svc.updateInput != nil || svc.gotLimit != 0 ||
-			svc.requestedID != uuid.Nil || svc.gotCheckLimit != 0 {
+			svc.requestedID != uuid.Nil || svc.gotCheckLimit != 0 || svc.gotIncidentLimit != 0 ||
+			svc.gotStatsWindow != "" {
 			t.Errorf("%s: the request reached the service without a credential", op)
 		}
 	}

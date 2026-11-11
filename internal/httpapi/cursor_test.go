@@ -64,7 +64,7 @@ func TestCursorKindMismatchIsRejected(t *testing.T) {
 	}
 
 	unknown := base64.RawURLEncoding.EncodeToString(
-		[]byte(`{"k":"incident","t":"2026-11-11T12:00:00Z","i":7}`))
+		[]byte(`{"k":"outage","t":"2026-11-11T12:00:00Z","i":7}`))
 	if _, err := decodeCheckCursor(unknown); !errors.Is(err, errBadCursor) {
 		t.Errorf("unknown kind accepted as a check cursor: err = %v", err)
 	}
@@ -108,6 +108,75 @@ func TestCheckCursorRejectsInvalidPayloads(t *testing.T) {
 	} {
 		encoded := base64.RawURLEncoding.EncodeToString([]byte(payload))
 		if _, err := decodeCheckCursor(encoded); !errors.Is(err, errBadCursor) {
+			t.Errorf("payload %s: err = %v, want errBadCursor", payload, err)
+		}
+	}
+}
+
+func TestIncidentCursorRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	want := monitor.IncidentCursor{
+		StartedAt: time.Date(2026, time.November, 11, 12, 0, 0, 123456789, time.UTC),
+		ID:        uuid.New(),
+	}
+
+	got, err := decodeIncidentCursor(encodeIncidentCursor(&want))
+	if err != nil {
+		t.Fatalf("decodeIncidentCursor() returned an unexpected error: %v", err)
+	}
+	if got.ID != want.ID || !got.StartedAt.Equal(want.StartedAt) {
+		t.Errorf("round trip = %+v, want %+v", *got, want)
+	}
+
+	if encodeIncidentCursor(nil) != "" {
+		t.Error("a nil cursor did not encode to the empty string")
+	}
+	if c, err := decodeIncidentCursor(""); c != nil || err != nil {
+		t.Errorf("empty cursor = %v, %v; want nil, nil", c, err)
+	}
+}
+
+// TestIncidentCursorKindMismatchIsRejected matters most for monitor cursors:
+// they have the same (time, UUID) shape as incident cursors, so only the kind
+// tells them apart.
+func TestIncidentCursorKindMismatchIsRejected(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.New()
+	monitorCursor := encodeCursor(&monitor.Cursor{CreatedAt: time.Now(), ID: id})
+	checkCursor := encodeCheckCursor(&monitor.CheckCursor{CheckedAt: time.Now(), ID: 7})
+	incidentCursor := encodeIncidentCursor(&monitor.IncidentCursor{StartedAt: time.Now(), ID: id})
+	legacyMonitorCursor := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"t":"2026-08-17T12:00:00Z","i":"` + id.String() + `"}`))
+
+	for name, cursor := range map[string]string{
+		"monitor": monitorCursor, "check": checkCursor, "kind-less monitor": legacyMonitorCursor,
+	} {
+		if _, err := decodeIncidentCursor(cursor); !errors.Is(err, errBadCursor) {
+			t.Errorf("%s cursor decoded as an incident cursor: err = %v", name, err)
+		}
+	}
+	if _, err := decodeCursor(incidentCursor); !errors.Is(err, errBadCursor) {
+		t.Errorf("incident cursor decoded as a monitor cursor: err = %v", err)
+	}
+	if _, err := decodeCheckCursor(incidentCursor); !errors.Is(err, errBadCursor) {
+		t.Errorf("incident cursor decoded as a check cursor: err = %v", err)
+	}
+}
+
+func TestIncidentCursorRejectsInvalidPayloads(t *testing.T) {
+	t.Parallel()
+
+	for _, payload := range []string{
+		`{"k":"incident","t":"2026-11-11T12:00:00Z","i":"00000000-0000-0000-0000-000000000000"}`,
+		`{"k":"incident","t":"2026-11-11T12:00:00Z","i":"not-a-uuid"}`,
+		`{"k":"incident","t":"2026-11-11T12:00:00Z","i":7}`,
+		`{"k":"incident","i":"11111111-2222-3333-4444-555555555555"}`,
+		`not json`,
+	} {
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(payload))
+		if _, err := decodeIncidentCursor(encoded); !errors.Is(err, errBadCursor) {
 			t.Errorf("payload %s: err = %v, want errBadCursor", payload, err)
 		}
 	}

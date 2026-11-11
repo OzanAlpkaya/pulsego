@@ -1,6 +1,7 @@
 // Command worker runs the claim-and-check loop: it claims due monitors with
 // time-bounded leases, checks them with bounded concurrency, records the
-// results, and drains in-flight checks on SIGINT/SIGTERM.
+// results, and drains in-flight checks on SIGINT/SIGTERM. Next to it, a
+// retention runner deletes check history older than CHECK_RETENTION_DAYS.
 package main
 
 import (
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/google/uuid"
@@ -57,6 +59,12 @@ func run() error {
 	chk := checker.New()
 	defer chk.CloseIdleConnections()
 
+	// Retention runs next to the scheduler on the same signal context. It
+	// adds worker_id to its logs, so concurrent cleaners can be told apart.
+	var retentionDone sync.WaitGroup
+	retention := scheduler.NewRetention(repository.NewRetentionStore(pool), cfg.Checks.RetentionDays, log)
+	retentionDone.Go(func() { retention.Run(ctx) })
+
 	// Returns once the signal context is cancelled and every in-flight check
 	// has finished or, after cfg.ShutdownTimeout, been cancelled and released.
 	scheduler.New(store, chk, scheduler.Config{
@@ -67,6 +75,11 @@ func run() error {
 		LeaseDuration:   cfg.Worker.LeaseDuration,
 		ShutdownTimeout: cfg.ShutdownTimeout,
 	}, baseLog).Run(ctx)
+
+	// The retention runner returns as soon as the signal context is done; a
+	// DELETE in flight is cancelled and rolls back. Wait for it before the
+	// deferred pool.Close.
+	retentionDone.Wait()
 
 	log.Info("stopped")
 	return nil

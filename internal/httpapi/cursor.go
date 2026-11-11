@@ -19,8 +19,9 @@ var errBadCursor = errors.New("invalid cursor")
 // Cursor kinds. Every payload names the list it belongs to, so a cursor from
 // one endpoint sent to another is rejected instead of being reinterpreted.
 const (
-	cursorKindMonitor = "monitor"
-	cursorKindCheck   = "check"
+	cursorKindMonitor  = "monitor"
+	cursorKindCheck    = "check"
+	cursorKindIncident = "incident"
 )
 
 // cursorPayload is the wire form of a monitor-list keyset position. It is
@@ -41,6 +42,14 @@ type checkCursorPayload struct {
 	Kind      string    `json:"k"`
 	CheckedAt time.Time `json:"t"`
 	ID        int64     `json:"i"`
+}
+
+// incidentCursorPayload is the wire form of an incident-history keyset
+// position.
+type incidentCursorPayload struct {
+	Kind      string    `json:"k"`
+	StartedAt time.Time `json:"t"`
+	ID        uuid.UUID `json:"i"`
 }
 
 // encodeCursor renders a monitor cursor for the next-page link. A nil cursor
@@ -112,6 +121,43 @@ func decodeCheckCursor(encoded string) (*monitor.CheckCursor, error) {
 	}
 
 	return &monitor.CheckCursor{CheckedAt: payload.CheckedAt, ID: payload.ID}, nil
+}
+
+// encodeIncidentCursor renders an incident-history cursor for the next-page
+// link. A nil cursor encodes to the empty string.
+func encodeIncidentCursor(c *monitor.IncidentCursor) string {
+	if c == nil {
+		return ""
+	}
+	return encodePayload(incidentCursorPayload{Kind: cursorKindIncident, StartedAt: c.StartedAt, ID: c.ID})
+}
+
+// decodeIncidentCursor parses an incident-history cursor supplied by a client.
+// An empty string means the first page. The kind is mandatory, as for check
+// cursors: a monitor cursor has the same shape (a time and a UUID), and only
+// the kind keeps it from being silently reinterpreted here.
+func decodeIncidentCursor(encoded string) (*monitor.IncidentCursor, error) {
+	if encoded == "" {
+		return nil, nil
+	}
+
+	kind, raw, err := decodeKind(encoded)
+	if err != nil {
+		return nil, err
+	}
+	if kind != cursorKindIncident {
+		return nil, errBadCursor
+	}
+
+	var payload incidentCursorPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, errBadCursor
+	}
+	if payload.StartedAt.IsZero() || payload.ID == uuid.Nil {
+		return nil, errBadCursor
+	}
+
+	return &monitor.IncidentCursor{StartedAt: payload.StartedAt, ID: payload.ID}, nil
 }
 
 // encodePayload marshals a cursor payload and base64url-encodes it.

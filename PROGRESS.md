@@ -1,7 +1,7 @@
 # PulseGo — Progress
 
 Last updated: 2026-11-11
-Current sprint: **Sprint 4 — State and Incidents** (not started)
+Current sprint: **Sprint 5 — Production Hardening** (not started; Sprint 4 done and merged)
 
 ---
 
@@ -643,17 +643,458 @@ Notes:
 ---
 
 ## Sprint 4 — State and Incidents
-Status: **Not Started**
+Status: **Done** (2026-11-11)
 Branch: `feature/sprint-04-state-incidents`
 
 Definition of Done:
-- [ ] State transition table covered by unit tests for every edge
-- [ ] Incident open/resolve is transactional and race-safe
-- [ ] Only one unresolved incident per monitor is possible (DB-enforced)
-- [ ] Stats endpoint correct for all three windows (24h/7d/30d)
+- [x] State transition table covered by unit tests for every edge
+      (`TestTransition`, `TestTransitionCoversEveryAllowedEdge`,
+      `TestTransitionNeverLeavesAllowedEdges`, `TestTransitionErrors`)
+- [x] Incident open/resolve is transactional and race-safe
+      (`TestRecordLifecycleOpensAndResolvesIncident`,
+      `TestRecordConcurrentResultsForOneMonitor`,
+      `TestRecordReadsStateUnderRowLock`,
+      `TestRecordRollsBackOnIncidentFailure`)
+- [x] Only one unresolved incident per monitor is possible (DB-enforced)
+      (`TestIncidentsOneUnresolvedPerMonitor`,
+      `TestIncidentsConcurrentUnresolvedInsert`)
+- [x] Stats endpoint correct for all three windows (24h/7d/30d)
+      (`TestMonitorStatsWindows`, `TestMonitorStatsEndpoint` in
+      `internal/repository` and `internal/httpapi`)
 
 Notes:
--
+- Plan approved 2026-11-11 (approval given in advance by the user for this
+  sprint; the user reviews these decisions before the squash-merge).
+  Implementation runs in agent-office, following the D10 commit order below.
+  The decisions below are binding and self-contained — an implementer should
+  not need the planning conversation. Anything not settled here is a question
+  for the user, not a guess (CLAUDE.md, "Ask, don't guess").
+- Decisions taken at sprint start (D1–D12 of the approved plan):
+  - **D1 — The state machine is a pure domain function**, in
+    `internal/domain/state.go`.
+    - **Signature:**
+      `func Transition(cur State, consecutiveFailures int32, threshold int16, success bool) (StateChange, error)`.
+      - `StateChange{From, To State; ConsecutiveFailures int32; Incident IncidentAction}`.
+      - `IncidentAction` is one of `IncidentNone`, `IncidentOpen` and
+        `IncidentResolve`.
+      - An invalid `cur`, or a threshold below 1, returns an error.
+    - **Allowed edges** are exactly ROADMAP's, plus self-loops:
+      unknown→up, unknown→degraded, up→up, up→degraded, degraded→up,
+      degraded→degraded, degraded→down, down→down and down→up. Nothing else
+      is allowed: no up→down, unknown→down or down→degraded.
+    - **Success:** failures reset to 0, and `To` is up, from any state.
+    - **Failure:** failures become the previous count + 1, saturating at
+      `MaxInt32`.
+      - From unknown or up → degraded.
+      - From degraded → down if the new failure count is ≥ the threshold,
+        otherwise degraded.
+      - From down → down.
+    - **Incidents:** `IncidentOpen` only on degraded→down; `IncidentResolve`
+      only on down→up.
+    - **Consequence, recorded explicitly:** because up→down is not an edge, a
+      monitor reaches down after `max(failure_threshold, 2)` consecutive
+      failures. With threshold 1, the first failure gives degraded and the
+      second gives down. Update the `StateDegraded`/`StateDown` doc comments
+      in `internal/domain/monitor.go` to say so. The threshold limits do not
+      change.
+    - **Lowering a threshold mid-outage** takes effect on the next failure: a
+      degraded monitor whose failures are ≥ the new threshold goes down on
+      its next failure.
+  - **D2 — `incidents` schema**, as migration
+    `db/migrations/00004_create_incidents.sql` (goose, with
+    `StatementBegin`/`StatementEnd` around each statement, as in `00003`):
+    ```sql
+    -- +goose Up
+    -- +goose StatementBegin
+    CREATE TABLE incidents (
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        monitor_id       UUID        NOT NULL REFERENCES monitors (id) ON DELETE CASCADE,
+        started_at       TIMESTAMPTZ NOT NULL,
+        resolved_at      TIMESTAMPTZ,
+        opening_check_id BIGINT      REFERENCES monitor_checks (id) ON DELETE SET NULL,
+        closing_check_id BIGINT      REFERENCES monitor_checks (id) ON DELETE SET NULL,
+        cause            TEXT,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT incidents_resolved_after_start
+            CHECK (resolved_at IS NULL OR resolved_at >= started_at),
+        CONSTRAINT incidents_closing_only_when_resolved
+            CHECK (closing_check_id IS NULL OR resolved_at IS NOT NULL),
+        CONSTRAINT incidents_cause_length
+            CHECK (cause IS NULL OR length(cause) <= 512)
+    );
+    -- +goose StatementEnd
+
+    -- DoD 3: the database, not the application, guarantees one open incident.
+    -- +goose StatementBegin
+    CREATE UNIQUE INDEX incidents_one_unresolved_per_monitor
+        ON incidents (monitor_id) WHERE resolved_at IS NULL;
+    -- +goose StatementEnd
+
+    -- +goose StatementBegin
+    CREATE INDEX incidents_history_idx
+        ON incidents (monitor_id, started_at DESC, id DESC);
+    -- +goose StatementEnd
+
+    -- Keep retention's ON DELETE SET NULL from scanning incidents per deleted check.
+    -- +goose StatementBegin
+    CREATE INDEX incidents_opening_check_idx
+        ON incidents (opening_check_id) WHERE opening_check_id IS NOT NULL;
+    -- +goose StatementEnd
+
+    -- +goose StatementBegin
+    CREATE INDEX incidents_closing_check_idx
+        ON incidents (closing_check_id) WHERE closing_check_id IS NOT NULL;
+    -- +goose StatementEnd
+
+    -- +goose Down
+    -- +goose StatementBegin
+    DROP TABLE incidents;
+    -- +goose StatementEnd
+    ```
+    - The check foreign keys are nullable and `ON DELETE SET NULL`, so
+      retention (D8) can delete old checks that an incident points at.
+    - **`cause`** is `"<error_kind>: <error_message>"` of the opening check,
+      or just `<error_kind>` when there is no message. It is truncated to
+      512 bytes on a rune boundary in Go; reuse the checker's truncation
+      helper, extracting it into `domain` if needed. It is never a response
+      body (Rule 10).
+    - **`started_at`** is the opening check's `checked_at`, and
+      **`resolved_at`** is the closing check's `checked_at`. Both are `now()`
+      in the same transaction, so they are identical to the check row's
+      value.
+    - `internal/domain/incident.go` holds an `Incident` struct that mirrors
+      the row.
+    - **Required test-helper change:** `truncateMonitors` becomes
+      `TRUNCATE incidents, monitor_checks, monitors`.
+  - **D3 — Recording a result is one transaction.** It replaces Sprint 3's
+    single-statement `RecordCheckResult`, which is deleted.
+    `SchedulerStore.Record` keeps its parameters and becomes:
+    1. `BEGIN` (READ COMMITTED).
+    2. `LockLeasedMonitor :one`:
+       ```sql
+       SELECT * FROM monitors
+       WHERE id = $monitor_id AND lease_owner = $worker_id AND deleted_at IS NULL
+       FOR UPDATE;
+       ```
+       No row → roll back and return `scheduler.ErrLeaseLost` (semantics
+       unchanged).
+    3. Compute `domain.Transition` from the **locked row's** `state`,
+       `consecutive_failures` and `failure_threshold`, never from the
+       claim-time snapshot.
+    4. `InsertCheck :one` inserts the `monitor_checks` row with
+       `checked_at = now()`, `RETURNING id`.
+    5. `ApplyCheckResult :exec` updates `monitors`: `state`,
+       `consecutive_failures`, `last_checked_at = now()`,
+       `last_status_code`, `last_latency_ms`, and `next_check_at` with
+       Sprint 3's
+       `CASE WHEN next_check_at = claimed_next_check_at THEN now() + interval ELSE next_check_at END`,
+       and sets `lease_owner`/`lease_until` to NULL. `updated_at` is left
+       untouched.
+    6. Depending on the incident action:
+       - `IncidentOpen` → `OpenIncident :execrows`:
+         ```sql
+         INSERT … VALUES (monitor_id, now(), check_id, cause)
+         ON CONFLICT (monitor_id) WHERE resolved_at IS NULL DO NOTHING;
+         ```
+         0 rows means an incident is already open, which is only possible if
+         state and incidents were edited by hand. It is not an error: the
+         store's caller logs it at warn via the returned change. A
+         constraint error here would wedge the monitor forever.
+       - `IncidentResolve` → `ResolveIncident :execrows`:
+         ```sql
+         UPDATE incidents SET resolved_at = now(), closing_check_id = $check_id
+         WHERE monitor_id = $1 AND resolved_at IS NULL;
+         ```
+         0 rows is not an error.
+    7. `COMMIT`. Any error → roll back. Nothing of the result persists, and
+       the lease stays held until it expires; it is then reclaimed, as in
+       Sprint 3.
+    - **Race-safety argument** (write it down in the code):
+      - Every writer of a result holds the monitor row lock from step 2
+        until commit, so results for one monitor serialize.
+      - The lease guard means a second, concurrent recorder finds no row.
+      - The partial unique index is the final guarantee.
+    - **Interfaces:**
+      - `NewSchedulerStore` takes
+        `interface{ sqlcgen.DBTX; Begin(context.Context) (pgx.Tx, error) }`,
+        which `*pgxpool.Pool` satisfies.
+      - `Record` returns `(domain.StateChange, error)`, and the scheduler's
+        `Store` interface changes to match.
+      - When `From != To`, the scheduler logs `monitor state changed` at
+        info, with `monitor_id`, `from`, `to` and the incident action. No
+        other scheduler behaviour changes.
+    - The claim (`ClaimDueMonitors`) is unchanged. Its `SKIP LOCKED` simply
+      skips a row that is being recorded.
+  - **D4 — `GET /v1/monitors/{monitorID}/incidents?limit=&cursor=`.**
+    - 404 for a missing or soft-deleted monitor; the service calls `Get`
+      first, as check history does. An existing monitor with no incidents
+      gets 200 with an empty `data`.
+    - Same `{data, next_cursor}` envelope, the same
+      `DefaultPageSize`/`MaxPageSize`, and the limit+1 trick.
+    - Order is `started_at DESC, id DESC`, with the keyset
+      `(started_at, id) < ($cursor_started_at, $cursor_id::uuid)`. The query
+      is `ListIncidents :many` in `db/queries/incidents.sql`.
+    - **Cursors:** a new cursor kind `incident` (`started_at` plus a UUID) in
+      `internal/httpapi/cursor.go`. A monitor or check cursor sent here, or
+      an incident cursor sent elsewhere, is a 400.
+    - **Responses:** an incident is returned as `id`, `monitor_id`,
+      `started_at`, `resolved_at`, `opening_check_id`, `closing_check_id`,
+      `cause` and `created_at`. Nullable fields are JSON `null`.
+  - **D5 — `GET /v1/monitors/{monitorID}/stats?window=24h|7d|30d`.**
+    - `window` omitted → `24h`. Any other value → 400 validation
+      problem+json naming the field `window`. 404 for a missing or deleted
+      monitor.
+    - **Query:** `GetMonitorStats :one` in `db/queries/stats.sql`. It is one
+      statement over the monitor's `monitor_checks` rows with
+      `checked_at > now() - make_interval(secs => $window_seconds)`, so the
+      start is exclusive and the end, `now()`, is inclusive. It selects:
+      - `count(*)`
+      - `count(*) FILTER (WHERE success)`
+      - `avg(latency_ms) FILTER (WHERE success)`
+      - `percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms) FILTER (WHERE success)`
+      - `now()` as the window end
+      The existing `monitor_checks_history_idx` serves it.
+    - **Latency stats cover successful checks only**, because a timeout's
+      latency is the timeout, not a response time. p95 uses
+      `percentile_disc`, so it is an observed value, in whole ms.
+    - **Response:** `{window, from, to, total_checks, successful_checks,
+      uptime_percent, avg_latency_ms, p95_latency_ms}`.
+      - `uptime_percent = successful / total * 100` and `avg_latency_ms` are
+        rounded to 2 decimals in Go, in `internal/domain/stats.go` (pure and
+        unit-tested).
+      - With 0 checks, `uptime_percent` is null. With 0 successful checks,
+        `avg_latency_ms` and `p95_latency_ms` are null.
+    - Windows are relative to the database's `now()`. If
+      `CHECK_RETENTION_DAYS` is below 30, the 30d window only covers
+      retained data; this is documented in the OpenAPI spec and the README.
+  - **D6 — OpenAPI and router.** Both operations go into `api/openapi.yaml`,
+    with the `Incident`, `IncidentPage` and `MonitorStats` schemas and the
+    400 for a bad window or cursor. `TestOpenAPIMatchesRouter` must then see
+    10 operations.
+  - **D7 — All Sprint 4 SQL lands in one commit.** The D2 migration and the
+    D3, D4, D5 and D8 queries go in together with the `sqlc generate`
+    output. Later sub-tasks do not edit `db/` or `sqlcgen` without the
+    lead's say-so.
+  - **D8 — Retention cleanup runs in `cmd/worker`.**
+    - Query:
+      ```sql
+      -- name: DeleteExpiredChecks :execrows
+      DELETE FROM monitor_checks
+      WHERE id IN (
+          SELECT id FROM monitor_checks
+          WHERE checked_at < now() - make_interval(days => sqlc.arg('retention_days')::int)
+          ORDER BY checked_at
+          LIMIT sqlc.arg('batch_size')
+          FOR UPDATE SKIP LOCKED
+      );
+      ```
+    - `internal/scheduler/retention.go` holds a `Retention` runner with its
+      own consumer interface:
+      `RetentionStore{ DeleteExpiredChecks(ctx, retentionDays, batchSize int32) (int64, error) }`.
+    - **Loop:**
+      - It runs once at startup, then every hour.
+      - Each run deletes in batches of 5000 until a batch returns fewer
+        rows, then logs the total deleted at info.
+      - An error is logged and retried on the next tick.
+      - It stops when the signal context is done.
+      - The interval and batch size are constants, not environment
+        variables.
+    - **Wiring:** `cmd/worker` starts it next to the scheduler, with
+      `CHECK_RETENTION_DAYS`.
+    - Several workers running it at once is safe: `SKIP LOCKED`, and
+      deletes are idempotent. Incidents keep their rows; their check
+      references become NULL.
+  - **D9 — No new environment variables.** The retention interval and batch
+    size, the cause length and the stats rounding are all code constants.
+  - **D10 — Commit order.** One concern per commit. Each agent-office
+    sub-task commits on its own branch, and they are merged at QA:
+    1. `docs:` this plan plus the status update (this commit).
+    2. `feat:` the state transition function, with table tests (D1).
+    3. `feat:` the incidents migration, all Sprint 4 queries, generated code,
+       the domain incident type and the truncate-helper change, with
+       migration and constraint tests (D2, D7).
+    4. `feat:` transactional check-result recording with incidents (D3),
+       with integration tests.
+    5. `feat:` the incident history endpoint (D4, D6).
+    6. `feat:` the stats endpoint (D5, D6).
+    7. `feat:` retention cleanup in the worker (D8).
+    8. `docs:` README, and close out Sprint 4 after the gate (D12).
+  - **D11 — Test list** (ROADMAP §5a categories). The DoD item each test
+    proves is in brackets.
+    - **Unit tests** (no tag):
+      - `TestTransition`: a table with one named case per edge, covering all
+        9 edges, including degraded→degraded below the threshold,
+        degraded→down at the threshold, threshold 1 behaviour, and down→down
+        incrementing the count. Each case asserts `To`, the failure count and
+        the incident action [DoD 1].
+      - `TestTransitionNeverLeavesAllowedEdges`: exhaustive over states ×
+        success × failures 0..12 × thresholds 1..10 [DoD 1].
+      - **Transition errors and saturation:** an invalid state or threshold
+        returns an error; the failure count saturates.
+      - **Stats maths:** rounding, zero totals, and all checks failed.
+      - **Cause:** formatting and truncation.
+      - **Handlers:** incidents 200, 404, pagination and the 400 on a
+        wrong-kind cursor; stats 200 for each window, the default window,
+        the 400 on a bad window, and 404.
+      - **Cursors:** round trip for the incident kind.
+      - **Retention runner**, with a fake store: batches until a short
+        batch, retries after an error, stops on cancel.
+      - **Scheduler:** logs the state change.
+    - **Integration tests** (`//go:build integration`, in
+      `internal/repository`):
+      - `TestIncidentsOneUnresolvedPerMonitor` [DoD 3]: a second unresolved
+        insert for one monitor fails with SQLSTATE 23505 on
+        `incidents_one_unresolved_per_monitor`. One unresolved plus one
+        resolved, and two resolved, are fine. Other monitors are
+        unaffected.
+      - `TestIncidentsConcurrentUnresolvedInsert` [DoD 3]: two transactions
+        insert an unresolved incident for one monitor concurrently; exactly
+        one commits.
+      - `TestIncidentsConstraints`: one case per D2 CHECK constraint.
+      - **Migrations:** `TestMigrationsUpDown` also asserts that
+        `incidents` appears and disappears.
+      - `TestRecordLifecycleOpensAndResolvesIncident` [DoD 2]: unknown → up
+        → degraded → degraded → down (one open incident, with
+        `opening_check_id` = that check, `started_at` = its `checked_at`,
+        and `cause` set) → down (no second incident) → up (resolved, with
+        `closing_check_id` set) → degraded → down (a second incident).
+      - `TestRecordConcurrentResultsForOneMonitor` [DoD 2]:
+        - A monitor is degraded at threshold − 1 and leased. 16 goroutines
+          behind a barrier, each with its own connection, Record a failure.
+          Exactly 1 returns nil and 15 return `ErrLeaseLost`; there is 1
+          check row, the state is down, and there is exactly 1 unresolved
+          incident.
+        - Then 30 re-armed rounds (lease set via SQL) of 8 concurrent
+          recorders with random success or failure. After every round,
+          exactly one recorder succeeded, the check row count equals the
+          round count, and (state = down) ⇔ exactly one unresolved
+          incident; never more than one.
+      - `TestRecordReadsStateUnderRowLock` [DoD 2]: an open transaction
+        holds `SELECT … FOR UPDATE` on the monitor, and Record blocks (not
+        done after 200ms). The transaction sets `consecutive_failures` to
+        threshold − 1 and the state to degraded, then commits. Record then
+        transitions to down and opens an incident, which proves it reads
+        the locked row.
+      - `TestRecordRollsBackOnIncidentFailure` [DoD 2]: a test-only trigger
+        raises on `INSERT INTO incidents`. Record at the threshold returns
+        an error (not `ErrLeaseLost`). There is no check row, the monitor's
+        state, failures and `last_*` fields are unchanged, and the lease is
+        still held.
+      - The existing `TestRecordCheckResult`,
+        `TestRecordPreservesManualRequestDuringCheck`,
+        `TestExpiredLeaseReclaimedByDifferentWorker` and the scheduler
+        end-to-end test keep passing on the new Record.
+      - `TestListIncidentsKeysetPagination`: includes rows that share a
+        `started_at`.
+      - `TestMonitorStatsWindows` [DoD 4]:
+        - Checks are inserted with explicit `checked_at` values about 1h,
+          2d, 10d and 40d ago, with mixed success and failure, known
+          latencies, and none near a window boundary.
+        - It asserts the exact total, successful count, avg and p95 for
+          24h, 7d and 30d.
+        - Another monitor's checks are excluded.
+        - An empty monitor gives zeros and nulls.
+      - An HTTP-level test hits the stats endpoint for all three windows
+        [DoD 4].
+      - `TestDeleteExpiredChecks`: only rows older than the retention period
+        are deleted, the batch size is respected, incident check references
+        become NULL, and incident rows remain.
+  - **D12 — Gate before reporting done.**
+    - Run the full `/sprint-done` gate: `gofmt -l`, `go vet` (also with
+      `-tags integration`), `go tool golangci-lint run` (also with
+      `--build-tags integration`), `go test -race ./...`,
+      `go tool govulncheck ./...`, and the three `-o bin/` builds.
+    - **Plus** the integration suite,
+      `go test -race -tags integration -count=1 -timeout 15m ./...`, with
+      `PULSEGO_TEST_DATABASE_URL` set after `pg-test-up`.
+    - Testcontainers mode is reported as **not run** (no Docker in the
+      sandbox).
+    - Record the real output under these Notes.
+    - **Do not merge or push** (Rule 2).
+- **Gate results (2026-11-11)**, D12, run on the D12 branch, whose base
+  (`bcdffe5`) holds the work of every Sprint 4 sub-task (Go 1.27.4 in the
+  agent-office sandbox, `GOTOOLCHAIN=local`):
+  - `go mod tidy` → no diff. `go tool sqlc generate` → no diff.
+  - `gofmt -l .` → empty.
+  - `go vet ./...` → rc=0 (also rc=0 with `-tags integration`).
+  - `go tool golangci-lint run` (v2.15.0) → `0 issues.` (also `0 issues.`
+    with `--build-tags integration`).
+  - `go test -race -count=1 ./...` → `ok` for checker, config, domain,
+    httpapi, monitor, scheduler and telemetry; rc=0.
+  - `go tool govulncheck ./...` (govulncheck v1.7.0, Go go1.27.4, DB updated
+    2026-11-11) → `No vulnerabilities found.`, rc=0. No waiver needed.
+  - `go build -o bin/api ./cmd/api`, `go build -o bin/worker ./cmd/worker`,
+    `go build -o bin/migrate ./cmd/migrate` → all rc=0.
+  - **Integration suite, `PULSEGO_TEST_DATABASE_URL` mode** (local
+    PostgreSQL 17 via `pg-test-up`), with
+    `go test -race -tags integration -count=1 -timeout 15m ./...`:
+    - Run 1 failed to **link** the scheduler test binary
+      (`runtime/race/internal/amd64v1(.text): relocation target
+      __popcountdi2 not defined`, `FAIL … internal/scheduler [build
+      failed]`). Every other package was `ok`. This is the same
+      race-runtime linker flake recorded under Sprint 3; no test ran and
+      failed.
+    - Runs 2 and 3, consecutive: all 8 packages `ok`, rc=0 (repository
+      2.058s / 2.050s, scheduler 1.806s / 1.808s).
+    - Targeted `-v` run of every DoD test above, plus
+      `TestIncidentsConstraints`, `TestListIncidentsKeysetPagination`,
+      `TestMigrationsUpDown` and `TestDeleteExpiredChecks`: `--- PASS` for
+      all 17 (`TestMonitorStatsEndpoint` exists in two packages), 0 skipped,
+      rc=0.
+    - Leftover `pulsego_test_*` databases afterwards: **0**.
+  - **Testcontainers mode** (variable unset): **not run**. The sandbox has
+    no Docker. (Since run on the host; see the host gate below.)
+  - README updated: incident and stats endpoints, the state machine and the
+    `max(failure_threshold, 2)` rule, the incident lifecycle, retention and
+    the 30d/retention caveat, and the status line.
+- **Host gate (2026-11-11)**, `/sprint-done` on the developer host, on
+  `feature/sprint-04-state-incidents` at `aab9e7a` (the QA merge), with
+  `GOTOOLCHAIN=go1.27.4` set for every Go command (`go version` →
+  `go1.27.4 linux/amd64`):
+  - `go mod tidy` → no diff. `go tool sqlc generate` → no diff.
+  - `gofmt -l .` → empty.
+  - `go vet ./...` → rc=0 (also rc=0 with `-tags integration`).
+  - `go tool golangci-lint run` → `0 issues.` (also `0 issues.` with
+    `--build-tags integration`).
+  - `go test -race -count=1 ./...` → `ok` for checker, config, domain,
+    httpapi, monitor, scheduler and telemetry; rc=0. No race-runtime linker
+    flake on the host.
+  - `go tool govulncheck ./...` → `No vulnerabilities found.`, rc=0.
+  - `go build -o bin/api ./cmd/api`, `go build -o bin/worker ./cmd/worker`,
+    `go build -o bin/migrate ./cmd/migrate` → all rc=0.
+  - **Integration suite, Testcontainers mode** (`PULSEGO_TEST_DATABASE_URL`
+    unset, Docker 29.9.3, Testcontainers-Go v0.44.0, `postgres:17-alpine`):
+    - `make test-integration` → all 8 test packages `ok`, rc=0, 43s wall
+      clock (repository 42.3s, scheduler 1.8s).
+    - `-v -count=1` run of `internal/repository` and `internal/scheduler`:
+      64 top-level `--- PASS`, 0 `--- FAIL`, 3 `--- SKIP`. The three skips
+      are the URL-mode-only `testdb` helper tests
+      (`TestSharedPoolNeverUsesTheURLDatabase`,
+      `TestCreateTestDatabaseIsNamedAndDroppedWithForce`,
+      `TestCreateTestDatabaseWithoutCreateDBNamesThePrivilege`), which skip
+      by design when the variable is unset.
+    - Every DoD test above, plus `TestIncidentsConstraints`,
+      `TestListIncidentsKeysetPagination`, `TestMigrationsUpDown` and
+      `TestDeleteExpiredChecks`: `--- PASS`.
+    - Containers left behind afterwards: **0**.
+  - Both integration modes have now passed for Sprint 4.
+- Review notes (2026-11-11, before the merge):
+  - Monitor-list cursors issued before cursors carried a kind (Sprint 2
+    format `{"t","i"}`) are still accepted by `GET /v1/monitors`:
+    `decodeCursor` lets an empty kind through, and its logic is unchanged
+    from `main`. Covered by `TestLegacyMonitorCursorStillDecodes`. Incident
+    and check cursors still require their kind, so a kind-less cursor is
+    never read as one of them (`TestIncidentCursorKindMismatchIsRejected`).
+  - **Decision (user, 2026-11-11): `failure_threshold: 1` is documented, not
+    rejected.** It stays a valid value and behaves like 2 (D1): reaching
+    down takes `max(failure_threshold, 2)` consecutive failures. Rejecting
+    it would have been a breaking API change plus a migration rewriting
+    existing rows. The limits stay 1–10. The README and the domain doc
+    comments already said so. The OpenAPI `state` description, which said
+    degraded means "`failure_threshold` has not been reached" and so was
+    wrong for threshold 1, now states the rule.
+- Known risk still open: no SSRF protection until Sprint 5 (see Sprint 3
+  Notes).
 
 ---
 

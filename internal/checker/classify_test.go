@@ -129,7 +129,7 @@ func TestErrorMessageTruncation(t *testing.T) {
 		})
 	}
 
-	if got := truncate("ok\xffbad", limit); !utf8.ValidString(got) {
-		t.Fatalf("truncate(invalid UTF-8) = %q, not valid UTF-8", got)
+	if got := domain.TruncateUTF8("ok\xffbad", limit); !utf8.ValidString(got) {
+		t.Fatalf("TruncateUTF8(invalid UTF-8) = %q, not valid UTF-8", got)
 	}
 }

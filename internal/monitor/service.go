@@ -170,6 +170,46 @@ func (s *Service) ListChecks(ctx context.Context, id uuid.UUID, limit int32, cur
 	return checks, &CheckCursor{CheckedAt: last.CheckedAt, ID: last.ID}, nil
 }
 
+// ListIncidents returns one page of a monitor's incident history, newest
+// first, along with the cursor for the next page, which is nil on the last
+// page. As with ListChecks, a missing or soft-deleted monitor is
+// domain.ErrNotFound, so an empty page always means "never down".
+func (s *Service) ListIncidents(ctx context.Context, id uuid.UUID, limit int32, cursor *IncidentCursor) ([]domain.Incident, *IncidentCursor, error) {
+	if _, err := s.store.Get(ctx, id); err != nil {
+		return nil, nil, err
+	}
+
+	limit = clampLimit(limit)
+
+	incidents, err := s.store.ListIncidents(ctx, ListIncidentsParams{MonitorID: id, Limit: limit + 1, Cursor: cursor})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(incidents) <= int(limit) {
+		return incidents, nil, nil
+	}
+
+	incidents = incidents[:limit]
+	last := incidents[len(incidents)-1]
+	return incidents, &IncidentCursor{StartedAt: last.StartedAt, ID: last.ID}, nil
+}
+
+// Stats summarises a monitor's availability and latency over one window. A
+// missing or soft-deleted monitor is domain.ErrNotFound, so a window with no
+// checks always means "not checked yet" rather than "no such monitor".
+func (s *Service) Stats(ctx context.Context, id uuid.UUID, window domain.StatsWindow) (domain.Stats, error) {
+	if _, err := s.store.Get(ctx, id); err != nil {
+		return domain.Stats{}, err
+	}
+
+	raw, err := s.store.GetStats(ctx, id, window)
+	if err != nil {
+		return domain.Stats{}, err
+	}
+	return domain.NewStats(window, raw), nil
+}
+
 // Update merges the requested changes over the stored monitor and validates the
 // result. Reading first is what lets a partial update be checked against the
 // cross-field rules: shortening an interval can invalidate a timeout that was

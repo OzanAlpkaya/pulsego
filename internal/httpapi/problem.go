@@ -88,6 +88,19 @@ func problemValidation(w http.ResponseWriter, r *http.Request, log *slog.Logger,
 	})
 }
 
+// problemInvalidQuery is a validation error in the query string rather than
+// the body. It is a 400, not a 422: there is no entity to be unprocessable,
+// the request itself names something that does not exist.
+func problemInvalidQuery(w http.ResponseWriter, r *http.Request, log *slog.Logger, verr *monitor.ValidationError) {
+	writeProblem(w, r, log, Problem{
+		Type:   TypeValidation,
+		Title:  "Validation Failed",
+		Status: http.StatusBadRequest,
+		Detail: "One or more query parameters are invalid.",
+		Errors: verr.Fields,
+	})
+}
+
 // problemInternal deliberately reveals nothing about the cause. The detail goes
 // to the log, keyed by the same request ID the caller receives.
 func problemInternal(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {

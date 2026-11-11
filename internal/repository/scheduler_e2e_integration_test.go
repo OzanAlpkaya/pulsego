@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/OzanAlpkaya/pulsego/internal/checker"
+	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/repository"
 	"github.com/OzanAlpkaya/pulsego/internal/scheduler"
 )
@@ -97,5 +98,19 @@ func TestSchedulerEndToEnd(t *testing.T) {
 	}
 	if n := countChecks(t, created.ID); n != 1 {
 		t.Fatalf("%d check rows, want exactly 1 (the next check is an interval away)", n)
+	}
+
+	var (
+		state    string
+		failures int32
+	)
+	if err := sharedPool.QueryRow(t.Context(),
+		`SELECT state, consecutive_failures FROM monitors WHERE id = $1`, created.ID).
+		Scan(&state, &failures); err != nil {
+		t.Fatalf("read monitor state: %v", err)
+	}
+	if state != string(domain.StateUp) || failures != 0 {
+		t.Fatalf("state = %q with %d failures after a successful check, want %q with 0",
+			state, failures, domain.StateUp)
 	}
 }

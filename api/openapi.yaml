@@ -27,6 +27,10 @@ tags:
     description: Monitor definitions
   - name: checks
     description: Manual checks and check history
+  - name: incidents
+    description: Incident history
+  - name: stats
+    description: Uptime and latency summaries
   - name: health
     description: Liveness
 
@@ -298,6 +302,125 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /v1/monitors/{monitorID}/incidents:
+    parameters:
+      - name: monitorID
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [incidents]
+      summary: List a monitor's incident history
+      description: |
+        Returns one page of incidents, newest first by `started_at` (ties are
+        broken by `id`). An incident opens when the monitor goes from
+        `degraded` to `down` and is resolved when it next goes `up`; at most
+        one incident per monitor is open (`resolved_at` null) at a time. A
+        monitor that has never been down returns an empty `data`; a missing or
+        deleted monitor is a 404.
+
+        Pagination works as for the check history, with its own cursor kind:
+        a monitor-list or check-history cursor sent here, or an
+        incident-history cursor sent to either of those, is a 400.
+      operationId: listIncidents
+      parameters:
+        - name: limit
+          in: query
+          description: Page size.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque cursor from a previous response's `next_cursor`.
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of incidents.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IncidentPage"
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/monitors/{monitorID}/stats:
+    parameters:
+      - name: monitorID
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [stats]
+      summary: Get a monitor's uptime and latency over a window
+      description: |
+        Aggregates the monitor's checks over the window `(to - window, to]`:
+        `to` is the database's current time, the start is exclusive and the
+        end inclusive. `from` is always exactly `to` minus the window.
+
+        - `uptime_percent` is `successful_checks / total_checks * 100`,
+          rounded to 2 decimals. It is null when the window holds no checks.
+        - Latency figures cover **successful checks only**: a failed check's
+          latency is usually its timeout, not a response time.
+          `avg_latency_ms` is rounded to 2 decimals; `p95_latency_ms` is
+          computed with `percentile_disc`, so it is a latency that was
+          actually observed, in whole milliseconds. Both are null when no
+          check in the window succeeded.
+
+        **Retention caveat:** checks older than `CHECK_RETENTION_DAYS` are
+        deleted. If that is below 30, the `30d` window (and, below 7, the
+        `7d` window) only covers the retained checks, although `from` still
+        reports the full window.
+
+        A missing or deleted monitor is a 404. Any `window` other than the
+        three listed is a 400 validation problem naming the field `window`.
+      operationId: getMonitorStats
+      parameters:
+        - name: window
+          in: query
+          description: The period to aggregate over, ending now.
+          required: false
+          schema:
+            type: string
+            enum: ["24h", "7d", "30d"]
+            default: "24h"
+      responses:
+        "200":
+          description: The monitor's stats over the window.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitorStats"
+        "400":
+          description: |
+            The monitor id is not a UUID (`urn:pulsego:problem:malformed-request`),
+            or `window` is not one of `24h`, `7d`, `30d`
+            (`urn:pulsego:problem:validation-error`, with an `errors` entry for
+            `window`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -424,8 +547,14 @@ components:
           type: string
           enum: [unknown, up, degraded, down]
           description: |
-            `unknown` until the first check. `degraded` means at least one
-            failure has occurred but `failure_threshold` has not been reached.
+            `unknown` until the first check. `up` after any successful check.
+            The first failure from `unknown` or `up` always gives `degraded`,
+            because there is no direct `up` → `down` transition. A degraded
+            monitor goes `down`, and opens an incident, once
+            `consecutive_failures` reaches `failure_threshold`. Reaching
+            `down` therefore takes `max(failure_threshold, 2)` consecutive
+            failures: with `failure_threshold: 1`, the first failure gives
+            `degraded` and the second gives `down`.
         consecutive_failures:
           type: integer
         last_checked_at:
@@ -486,6 +615,128 @@ components:
         checked_at:
           type: string
           format: date-time
+
+    Incident:
+      type: object
+      description: |
+        A period during which the monitor was down. `started_at` and
+        `resolved_at` are the `checked_at` of the opening and closing checks.
+        The check references become null once retention deletes those checks;
+        the incident itself is kept.
+      required:
+        - id
+        - monitor_id
+        - started_at
+        - resolved_at
+        - opening_check_id
+        - closing_check_id
+        - cause
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        monitor_id:
+          type: string
+          format: uuid
+        started_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: [string, "null"]
+          format: date-time
+          description: Null while the incident is open.
+        opening_check_id:
+          type: [integer, "null"]
+          format: int64
+          description: The check that opened the incident; null once retention has deleted it.
+        closing_check_id:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            The check that resolved the incident. Null while the incident is
+            open, and once retention has deleted the check.
+        cause:
+          type: [string, "null"]
+          maxLength: 512
+          description: |
+            `<error_kind>: <error_message>` of the opening check, or just
+            `<error_kind>` when it had no message. Never a response body.
+        created_at:
+          type: string
+          format: date-time
+
+    IncidentPage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Incident"
+        next_cursor:
+          type: string
+          description: Omitted on the last page.
+
+    MonitorStats:
+      type: object
+      description: |
+        Uptime and latency of one monitor over one window. Latency figures
+        cover successful checks only. Checks older than
+        `CHECK_RETENTION_DAYS` are not counted, even inside the window.
+      required:
+        - window
+        - from
+        - to
+        - total_checks
+        - successful_checks
+        - uptime_percent
+        - avg_latency_ms
+        - p95_latency_ms
+      properties:
+        window:
+          type: string
+          enum: ["24h", "7d", "30d"]
+        from:
+          type: string
+          format: date-time
+          description: Exclusive start of the window; always `to` minus the window.
+        to:
+          type: string
+          format: date-time
+          description: Inclusive end of the window, the database's current time.
+        total_checks:
+          type: integer
+          format: int64
+          minimum: 0
+        successful_checks:
+          type: integer
+          format: int64
+          minimum: 0
+        uptime_percent:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 100
+          description: |
+            `successful_checks / total_checks * 100`, rounded to 2 decimals.
+            Null when the window holds no checks.
+          examples: [99.31]
+        avg_latency_ms:
+          type: [number, "null"]
+          minimum: 0
+          description: |
+            Mean latency of the successful checks, rounded to 2 decimals.
+            Null when no check in the window succeeded.
+          examples: [182.45]
+        p95_latency_ms:
+          type: [integer, "null"]
+          format: int32
+          minimum: 0
+          description: |
+            95th percentile latency of the successful checks, computed with
+            `percentile_disc`, so it is an observed value in whole
+            milliseconds. Null when no check in the window succeeded.
+          examples: [412]
 
     CreateMonitorRequest:
       type: object

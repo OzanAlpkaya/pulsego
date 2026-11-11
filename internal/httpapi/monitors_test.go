@@ -39,6 +39,14 @@ type stubService struct {
 	requestedID    uuid.UUID
 	gotCheckLimit  int32
 	gotCheckCursor *monitor.CheckCursor
+
+	incidents         []domain.Incident
+	incidentsNext     *monitor.IncidentCursor
+	gotIncidentLimit  int32
+	gotIncidentCursor *monitor.IncidentCursor
+
+	stats          domain.Stats
+	gotStatsWindow domain.StatsWindow
 }
 
 func (s *stubService) Create(_ context.Context, in monitor.CreateInput) (domain.Monitor, error) {
@@ -73,6 +81,16 @@ func (s *stubService) RequestCheck(_ context.Context, id uuid.UUID) (domain.Moni
 func (s *stubService) ListChecks(_ context.Context, _ uuid.UUID, limit int32, cursor *monitor.CheckCursor) ([]domain.Check, *monitor.CheckCursor, error) {
 	s.gotCheckLimit, s.gotCheckCursor = limit, cursor
 	return s.checks, s.checksNext, s.err
+}
+
+func (s *stubService) ListIncidents(_ context.Context, _ uuid.UUID, limit int32, cursor *monitor.IncidentCursor) ([]domain.Incident, *monitor.IncidentCursor, error) {
+	s.gotIncidentLimit, s.gotIncidentCursor = limit, cursor
+	return s.incidents, s.incidentsNext, s.err
+}
+
+func (s *stubService) Stats(_ context.Context, _ uuid.UUID, window domain.StatsWindow) (domain.Stats, error) {
+	s.gotStatsWindow = window
+	return s.stats, s.err
 }
 
 func newTestRouter(t *testing.T, svc httpapi.MonitorService) http.Handler {

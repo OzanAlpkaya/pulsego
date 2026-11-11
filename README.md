@@ -10,11 +10,12 @@ workers claim due monitors with `FOR UPDATE SKIP LOCKED` and hold time-bounded
 leases, so several workers can run without double-processing and a crashed
 worker's monitors become reclaimable on their own.
 
-> **Status: Sprint 2 of 6 complete.** The foundation and the monitor CRUD API
-> are in place. The scheduler and checker (Sprint 3), incidents (Sprint 4),
-> SSRF protection and observability (Sprint 5), and the dashboard plus the full
-> README (Sprint 6) are still to come — so monitors can be registered, but
-> nothing checks them yet. See `ROADMAP.md` and `PROGRESS.md`.
+> **Status: Sprint 4 of 6 complete.** Monitors can be registered, workers
+> check them on a schedule, and persistent failures open and resolve
+> incidents. SSRF protection and observability (Sprint 5) and the dashboard
+> plus the full README (Sprint 6) are still to come — until Sprint 5, do not
+> point the worker at untrusted monitor input. See `ROADMAP.md` and
+> `PROGRESS.md`.
 
 ## Quick start
 
@@ -70,6 +71,12 @@ curl -X POST localhost:8080/v1/monitors/<id>/checks -H "Authorization: Bearer $K
 # Check history, newest first; paged like the monitor list
 curl "localhost:8080/v1/monitors/<id>/checks?limit=20" -H "Authorization: Bearer $KEY"
 
+# Incident history, newest first; paged like the monitor list
+curl "localhost:8080/v1/monitors/<id>/incidents?limit=20" -H "Authorization: Bearer $KEY"
+
+# Uptime and latency over a window: 24h (the default), 7d or 30d
+curl "localhost:8080/v1/monitors/<id>/stats?window=7d" -H "Authorization: Bearer $KEY"
+
 # Soft delete
 curl -X DELETE localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY"
 ```
@@ -103,6 +110,98 @@ Two behaviours worth knowing:
   scheduled time would otherwise fall outside the new interval, so editing a
   monitor never delays a check that is already due, and a bulk edit does not
   make everything due at once.
+
+## Monitor state and incidents
+
+Each check result moves the monitor through a small state machine. These are
+the only edges (`internal/domain/state.go`):
+
+| From       | Success | Failure                                          |
+|------------|---------|--------------------------------------------------|
+| `unknown`  | `up`    | `degraded`                                       |
+| `up`       | `up`    | `degraded`                                       |
+| `degraded` | `up`    | `down` once failures ≥ threshold, else `degraded` |
+| `down`     | `up`    | `down`                                           |
+
+A success resets `consecutive_failures` to 0; a failure adds one. There is no
+`up → down` edge, so a monitor needs **`max(failure_threshold, 2)`**
+consecutive failures to reach `down`. With `failure_threshold: 1`, the first
+failure gives `degraded` and the second gives `down`. Lowering the threshold
+during an outage takes effect on the next failure.
+
+Incidents follow the state:
+
+- **Open** on `degraded → down`. `started_at` is the failing check's
+  `checked_at`, `opening_check_id` points at that check, and `cause` is
+  `"<error_kind>: <error_message>"` (or just the kind), at most 512 bytes. It is
+  never a response body.
+- **Resolve** on `down → up`. `resolved_at` and `closing_check_id` come from
+  the first successful check.
+- `down → down` opens nothing new. A monitor has at most one unresolved
+  incident; a partial unique index enforces that in the database.
+
+Recording a result is one transaction: lock the monitor row, compute the
+transition from the locked row, insert the check, update the monitor, open or
+resolve the incident, commit. If any step fails, nothing is kept and the lease
+expires and is reclaimed as usual.
+
+An incident page looks like this; `resolved_at` and `closing_check_id` are
+`null` while it is open:
+
+```json
+{
+  "data": [
+    {
+      "id": "6f1c0c2e-7c55-4b0e-9a57-2d4f3b8f7a10",
+      "monitor_id": "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b",
+      "started_at": "2026-11-11T09:14:02.511Z",
+      "resolved_at": null,
+      "opening_check_id": 4812,
+      "closing_check_id": null,
+      "cause": "unexpected_status: status 503 outside expected range 200-299",
+      "created_at": "2026-11-11T09:14:02.511Z"
+    }
+  ]
+}
+```
+
+### Stats
+
+`GET /v1/monitors/{id}/stats?window=24h|7d|30d` summarises the checks in the
+window `(now − window, now]`, measured by the database clock:
+
+```json
+{
+  "window": "24h",
+  "from": "2026-11-10T09:20:00Z",
+  "to": "2026-11-11T09:20:00Z",
+  "total_checks": 1440,
+  "successful_checks": 1437,
+  "uptime_percent": 99.79,
+  "avg_latency_ms": 182.4,
+  "p95_latency_ms": 311
+}
+```
+
+- Latency figures cover **successful checks only**, since a timeout's latency
+  is just the timeout. `p95_latency_ms` is an observed value
+  (`percentile_disc`), in whole milliseconds.
+- `uptime_percent` and `avg_latency_ms` are rounded to two decimals.
+- With no checks in the window, `uptime_percent` is `null`; with no successful
+  checks, both latency fields are `null`.
+- Any other `window` value is a `400` naming the field `window`.
+
+### Retention
+
+The worker deletes checks older than `CHECK_RETENTION_DAYS` (default 30,
+range 1–365). It runs once at startup and then every hour, deleting in
+batches of 5000 until a batch comes back short. Several workers can run it at
+once safely. Incidents are kept; their `opening_check_id` and
+`closing_check_id` become `null` once those checks are deleted.
+
+**Caveat:** stats only see retained checks. With `CHECK_RETENTION_DAYS` below
+30, the `30d` window covers only the retained days (and below 7, so does the
+`7d` window).
 
 ## Configuration
 

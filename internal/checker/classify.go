@@ -8,9 +8,7 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"strings"
 	"syscall"
-	"unicode/utf8"
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 )
@@ -86,19 +84,5 @@ func errorMessage(err error) string {
 	if errors.As(err, &urlErr) && urlErr.Err != nil {
 		err = urlErr.Err
 	}
-	return truncate(err.Error(), domain.MaxErrorMessageLength)
-}
-
-// truncate returns s as valid UTF-8, cut to at most limit bytes without
-// splitting a rune.
-func truncate(s string, limit int) string {
-	s = strings.ToValidUTF8(s, "�")
-	if len(s) <= limit {
-		return s
-	}
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
+	return domain.TruncateUTF8(err.Error(), domain.MaxErrorMessageLength)
 }

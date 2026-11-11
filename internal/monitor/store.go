@@ -24,6 +24,12 @@ type Store interface {
 	RequestCheck(ctx context.Context, id uuid.UUID) (domain.Monitor, error)
 	// ListChecks returns one page of a monitor's check history, newest first.
 	ListChecks(ctx context.Context, p ListChecksParams) ([]domain.Check, error)
+	// ListIncidents returns one page of a monitor's incident history, newest
+	// first.
+	ListIncidents(ctx context.Context, p ListIncidentsParams) ([]domain.Incident, error)
+	// GetStats aggregates a monitor's checks over the window ending at the
+	// database's now().
+	GetStats(ctx context.Context, monitorID uuid.UUID, window domain.StatsWindow) (domain.RawStats, error)
 }
 
 // CreateParams holds fully resolved values: defaults are applied and validation
@@ -79,4 +85,19 @@ type ListChecksParams struct {
 type CheckCursor struct {
 	CheckedAt time.Time
 	ID        int64
+}
+
+// ListIncidentsParams describes one page of a monitor's incident history.
+// Cursor is nil for the first page.
+type ListIncidentsParams struct {
+	MonitorID uuid.UUID
+	Limit     int32
+	Cursor    *IncidentCursor
+}
+
+// IncidentCursor is the keyset position of the last incident of a page.
+// Several incidents can share a started_at, so the id breaks ties.
+type IncidentCursor struct {
+	StartedAt time.Time
+	ID        uuid.UUID
 }

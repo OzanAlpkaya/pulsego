@@ -19,10 +19,15 @@ const (
 	StateUnknown State = "unknown"
 	// StateUp means the last check succeeded and no failures are pending.
 	StateUp State = "up"
-	// StateDegraded means at least one check has failed, but the failure
-	// threshold has not been reached yet.
+	// StateDegraded means at least one check has failed, but the monitor is
+	// not down yet. Every first failure after unknown or up lands here, even
+	// with a failure threshold of 1, because up→down is not an edge.
 	StateDegraded State = "degraded"
-	// StateDown means consecutive failures reached the monitor's threshold.
+	// StateDown means consecutive failures reached the monitor's threshold
+	// while it was degraded. Since a monitor must pass through degraded
+	// first, reaching down takes max(failure_threshold, 2) consecutive
+	// failures: with threshold 1, the first failure gives degraded and the
+	// second gives down.
 	StateDown State = "down"
 )
 

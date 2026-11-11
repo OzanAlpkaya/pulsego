@@ -114,7 +114,7 @@ func TestMigrationsUpDown(t *testing.T) {
 }
 
 // migratedTables lists every table the migrations create.
-var migratedTables = []string{"monitors", "monitor_checks"}
+var migratedTables = []string{"monitors", "monitor_checks", "incidents"}
 
 func tableExists(t *testing.T, sqlDB *sql.DB, table string) bool {
 	t.Helper()
