@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
@@ -124,6 +125,12 @@ func TestOpenAPIMatchesRouter(t *testing.T) {
 	documented := documentedOperations(t, doc)
 	implemented := implementedOperations(t)
 
+	// healthz, the five monitor operations, and the two check operations. A
+	// change here is a change to the API surface and should be deliberate.
+	if got, want := len(implemented), 8; got != want {
+		t.Errorf("router implements %d operations, want %d: %v", got, want, implemented)
+	}
+
 	// chi renders path parameters as {name}, matching OpenAPI, so the two sets
 	// are directly comparable.
 	for _, op := range implemented {
@@ -213,7 +220,8 @@ func TestUnauthenticatedRequestsNeverReachTheService(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Errorf("%s: status = %d, want 401", op, rec.Code)
 		}
-		if svc.createInput != nil || svc.updateInput != nil || svc.gotLimit != 0 {
+		if svc.createInput != nil || svc.updateInput != nil || svc.gotLimit != 0 ||
+			svc.requestedID != uuid.Nil || svc.gotCheckLimit != 0 {
 			t.Errorf("%s: the request reached the service without a credential", op)
 		}
 	}

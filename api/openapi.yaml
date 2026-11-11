@@ -25,6 +25,8 @@ security:
 tags:
   - name: monitors
     description: Monitor definitions
+  - name: checks
+    description: Manual checks and check history
   - name: health
     description: Liveness
 
@@ -209,6 +211,93 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /v1/monitors/{monitorID}/checks:
+    parameters:
+      - name: monitorID
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    post:
+      tags: [checks]
+      summary: Request a manual check
+      description: |
+        Makes the monitor due now, so that the next worker poll checks it. The
+        check runs asynchronously: the response confirms the request, and the
+        result appears in the check history once a worker has run it.
+
+        A disabled monitor is never checked, so requesting a check for one is
+        a 409 rather than a request that silently does nothing.
+      operationId: requestCheck
+      responses:
+        "202":
+          description: The check was requested. The body is the monitor, with `next_check_at` moved to now.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Monitor"
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/MonitorDisabled"
+
+    get:
+      tags: [checks]
+      summary: List a monitor's check history
+      description: |
+        Returns one page of check results, newest first. A monitor with no
+        checks yet returns an empty `data`; a missing or deleted monitor is a
+        404.
+
+        Pagination works as for the monitor list, but cursors are not
+        interchangeable: a monitor-list cursor sent here (or a check-history
+        cursor sent to the monitor list) is a 400.
+      operationId: listChecks
+      parameters:
+        - name: limit
+          in: query
+          description: Page size.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque cursor from a previous response's `next_cursor`.
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of check results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Check"
+                  next_cursor:
+                    type: string
+                    description: Omitted on the last page.
+        "400":
+          $ref: "#/components/responses/Malformed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -237,6 +326,14 @@ components:
             $ref: "#/components/schemas/Problem"
     ValidationFailed:
       description: The body parsed but one or more fields are invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    MonitorDisabled:
+      description: |
+        The monitor is disabled, so it cannot be checked. Enable it first. The
+        problem type is `urn:pulsego:problem:monitor-disabled`.
       content:
         application/problem+json:
           schema:
@@ -345,6 +442,48 @@ components:
           type: string
           format: date-time
         updated_at:
+          type: string
+          format: date-time
+
+    Check:
+      type: object
+      description: |
+        One stored check result. `success` is true exactly when `error_kind`
+        is null; a successful check always has a `status_code`, and
+        `error_message` is only set on failure. Response bodies are never
+        stored.
+      required:
+        - id
+        - success
+        - status_code
+        - latency_ms
+        - error_kind
+        - error_message
+        - checked_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        success:
+          type: boolean
+        status_code:
+          type: [integer, "null"]
+          minimum: 100
+          maximum: 599
+          description: Null when no response arrived.
+        latency_ms:
+          type: integer
+          minimum: 0
+          description: |
+            Time until response headers arrived or, on failure, until the
+            failure.
+        error_kind:
+          type: [string, "null"]
+          enum: [timeout, dns, connection, tls, redirect, unexpected_status, unknown, null]
+        error_message:
+          type: [string, "null"]
+          maxLength: 512
+        checked_at:
           type: string
           format: date-time
 

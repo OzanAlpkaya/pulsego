@@ -32,3 +32,14 @@ type Monitor struct {
 	UpdatedAt           time.Time
 	DeletedAt           *time.Time
 }
+
+type MonitorCheck struct {
+	ID           int64
+	MonitorID    uuid.UUID
+	Success      bool
+	StatusCode   *int32
+	LatencyMs    int32
+	ErrorKind    *string
+	ErrorMessage *string
+	CheckedAt    time.Time
+}

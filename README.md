@@ -64,6 +64,12 @@ curl localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY"
 curl -X PATCH localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY" \
   -d '{"enabled":false}'
 
+# Request a check now (202; 409 if the monitor is disabled)
+curl -X POST localhost:8080/v1/monitors/<id>/checks -H "Authorization: Bearer $KEY"
+
+# Check history, newest first; paged like the monitor list
+curl "localhost:8080/v1/monitors/<id>/checks?limit=20" -H "Authorization: Bearer $KEY"
+
 # Soft delete
 curl -X DELETE localhost:8080/v1/monitors/<id> -H "Authorization: Bearer $KEY"
 ```
@@ -123,12 +129,26 @@ Two rules are worth calling out:
 
 ```bash
 make test              # unit tests, race detector
-make test-integration  # Testcontainers; needs a Docker daemon
+make test-integration  # Testcontainers (Docker), or PULSEGO_TEST_DATABASE_URL
 make lint              # golangci-lint
 make vuln              # govulncheck
 make sqlc              # regenerate query code after editing db/queries
 make build             # binaries into bin/
 ```
+
+Integration tests start PostgreSQL containers through Testcontainers by
+default. To run them without Docker, point `PULSEGO_TEST_DATABASE_URL` at an
+existing PostgreSQL server whose role has the `CREATEDB` privilege:
+
+```bash
+PULSEGO_TEST_DATABASE_URL='postgres://user:pass@localhost:5432/postgres?sslmode=disable' \
+  make test-integration
+```
+
+The suite never writes to the database in that URL. It creates its own
+`pulsego_test_<random>` databases on the server, one per pristine-schema test
+plus one shared database, and drops each with `DROP DATABASE … WITH (FORCE)`
+when it is done. The application itself never reads this variable.
 
 Developer tools (`sqlc`, `golangci-lint`, `govulncheck`) are pinned as go.mod
 `tool` directives, so a bare checkout needs nothing installed beyond Go and

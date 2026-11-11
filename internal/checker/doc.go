@@ -1,6 +1,8 @@
-// Package checker executes outbound HTTP checks with bounded concurrency, a
-// shared and tuned http.Transport, per-request timeouts, and classification of
-// failures into timeout, DNS, connection, and unexpected-status kinds.
+// Package checker executes outbound HTTP checks over one shared, tuned
+// http.Transport, with a per-check deadline taken from the monitor, and
+// classifies failures into the domain.ErrorKind values (timeout, dns, redirect,
+// tls, connection, unexpected_status, unknown).
 //
-// Populated in Sprint 3.
+// Response bodies are drained through a bounded reader and discarded; they are
+// never stored or logged.
 package checker

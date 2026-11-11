@@ -1,14 +1,16 @@
 //go:build integration
 
-// Integration tests run against a real PostgreSQL container. They are behind
-// the `integration` build tag so that `go test ./...` stays fast and works
-// without a Docker daemon; run them with `make test-integration`.
+// Integration tests run against a real PostgreSQL: a Testcontainers container
+// by default, or the server named by PULSEGO_TEST_DATABASE_URL when it is set.
+// They are behind the `integration` build tag so that `go test ./...` stays
+// fast and works without a database; run them with `make test-integration`.
 package repository_test
 
 import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -24,12 +26,27 @@ import (
 
 const postgresImage = "postgres:17-alpine"
 
-// startPostgres brings up a throwaway PostgreSQL instance and returns its
-// connection URL. The container is terminated when the test finishes.
+// startPostgres brings up a throwaway, empty PostgreSQL database and returns
+// its connection URL. With PULSEGO_TEST_DATABASE_URL set it is a fresh
+// database on that server, dropped when the test finishes; otherwise it is a
+// container, terminated when the test finishes.
 func startPostgres(t *testing.T) string {
 	t.Helper()
 
 	ctx := context.Background()
+
+	if serverURL := os.Getenv(testDatabaseURLEnv); serverURL != "" {
+		url, drop, err := createTestDatabase(ctx, serverURL)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		t.Cleanup(func() {
+			if err := drop(); err != nil {
+				t.Errorf("%v", err)
+			}
+		})
+		return url
+	}
 
 	container, err := tcpostgres.Run(ctx, postgresImage,
 		tcpostgres.WithDatabase("pulsego"),
@@ -77,13 +94,10 @@ func TestMigrationsUpDown(t *testing.T) {
 
 	migrateUp(t, sqlDB)
 
-	var exists bool
-	err := sqlDB.QueryRowContext(t.Context(), `SELECT to_regclass('public.monitors') IS NOT NULL`).Scan(&exists)
-	if err != nil {
-		t.Fatalf("check monitors table: %v", err)
-	}
-	if !exists {
-		t.Fatal("monitors table does not exist after migrating up")
+	for _, table := range migratedTables {
+		if !tableExists(t, sqlDB, table) {
+			t.Errorf("%s table does not exist after migrating up", table)
+		}
 	}
 
 	// DownTo(0) unwinds every migration, not just the most recent one, which is
@@ -92,12 +106,24 @@ func TestMigrationsUpDown(t *testing.T) {
 		t.Fatalf("goose down: %v", err)
 	}
 
-	if err := sqlDB.QueryRowContext(t.Context(), `SELECT to_regclass('public.monitors') IS NOT NULL`).Scan(&exists); err != nil {
-		t.Fatalf("re-check monitors table: %v", err)
+	for _, table := range migratedTables {
+		if tableExists(t, sqlDB, table) {
+			t.Errorf("%s table still exists after migrating down", table)
+		}
 	}
-	if exists {
-		t.Error("monitors table still exists after migrating down")
+}
+
+// migratedTables lists every table the migrations create.
+var migratedTables = []string{"monitors", "monitor_checks"}
+
+func tableExists(t *testing.T, sqlDB *sql.DB, table string) bool {
+	t.Helper()
+
+	var exists bool
+	if err := sqlDB.QueryRowContext(t.Context(), `SELECT to_regclass('public.' || $1) IS NOT NULL`, table).Scan(&exists); err != nil {
+		t.Fatalf("check %s table: %v", table, err)
 	}
+	return exists
 }
 
 // TestMonitorsPartialIndex verifies the scheduler's hot-path index exists with

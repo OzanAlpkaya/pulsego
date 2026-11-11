@@ -21,6 +21,9 @@ const (
 	TypeUnauthorized = "urn:pulsego:problem:unauthorized"
 	TypeNotFound     = "urn:pulsego:problem:not-found"
 	TypeInternal     = "urn:pulsego:problem:internal-error"
+	// TypeMonitorDisabled is a 409: the request is valid, but conflicts with
+	// the monitor's current state until it is enabled again.
+	TypeMonitorDisabled = "urn:pulsego:problem:monitor-disabled"
 )
 
 // Problem is an RFC 7807 error document. Errors is an extension member listing
@@ -54,6 +57,15 @@ func problemNotFound(w http.ResponseWriter, r *http.Request, log *slog.Logger, d
 		Title:  "Not Found",
 		Status: http.StatusNotFound,
 		Detail: detail,
+	})
+}
+
+func problemMonitorDisabled(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
+	writeProblem(w, r, log, Problem{
+		Type:   TypeMonitorDisabled,
+		Title:  "Monitor Disabled",
+		Status: http.StatusConflict,
+		Detail: "the monitor is disabled; enable it before requesting a check",
 	})
 }
 

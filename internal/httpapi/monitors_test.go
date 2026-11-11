@@ -33,6 +33,12 @@ type stubService struct {
 	gotLimit    int32
 	gotCursor   *monitor.Cursor
 	deletedID   uuid.UUID
+
+	checks         []domain.Check
+	checksNext     *monitor.CheckCursor
+	requestedID    uuid.UUID
+	gotCheckLimit  int32
+	gotCheckCursor *monitor.CheckCursor
 }
 
 func (s *stubService) Create(_ context.Context, in monitor.CreateInput) (domain.Monitor, error) {
@@ -57,6 +63,16 @@ func (s *stubService) Update(_ context.Context, _ uuid.UUID, in monitor.UpdateIn
 func (s *stubService) Delete(_ context.Context, id uuid.UUID) error {
 	s.deletedID = id
 	return s.err
+}
+
+func (s *stubService) RequestCheck(_ context.Context, id uuid.UUID) (domain.Monitor, error) {
+	s.requestedID = id
+	return s.monitor, s.err
+}
+
+func (s *stubService) ListChecks(_ context.Context, _ uuid.UUID, limit int32, cursor *monitor.CheckCursor) ([]domain.Check, *monitor.CheckCursor, error) {
+	s.gotCheckLimit, s.gotCheckCursor = limit, cursor
+	return s.checks, s.checksNext, s.err
 }
 
 func newTestRouter(t *testing.T, svc httpapi.MonitorService) http.Handler {

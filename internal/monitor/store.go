@@ -18,6 +18,12 @@ type Store interface {
 	List(ctx context.Context, p ListParams) ([]domain.Monitor, error)
 	Update(ctx context.Context, p UpdateParams) (domain.Monitor, error)
 	SoftDelete(ctx context.Context, id uuid.UUID) error
+
+	// RequestCheck makes a monitor due now, returning domain.ErrNotFound if
+	// it is absent or soft-deleted.
+	RequestCheck(ctx context.Context, id uuid.UUID) (domain.Monitor, error)
+	// ListChecks returns one page of a monitor's check history, newest first.
+	ListChecks(ctx context.Context, p ListChecksParams) ([]domain.Check, error)
 }
 
 // CreateParams holds fully resolved values: defaults are applied and validation
@@ -58,4 +64,19 @@ type ListParams struct {
 type Cursor struct {
 	CreatedAt time.Time
 	ID        uuid.UUID
+}
+
+// ListChecksParams describes one page of a monitor's check history. Cursor is
+// nil for the first page.
+type ListChecksParams struct {
+	MonitorID uuid.UUID
+	Limit     int32
+	Cursor    *CheckCursor
+}
+
+// CheckCursor is the keyset position of the last check of a page. Check ids
+// are database identities, so they are int64 rather than UUIDs.
+type CheckCursor struct {
+	CheckedAt time.Time
+	ID        int64
 }

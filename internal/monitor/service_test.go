@@ -23,6 +23,10 @@ type fakeStore struct {
 	listParams   *monitor.ListParams
 	deletedID    *uuid.UUID
 
+	checks           []domain.Check
+	listChecksParams *monitor.ListChecksParams
+	requestedID      *uuid.UUID
+
 	err error
 }
 
@@ -77,6 +81,25 @@ func (f *fakeStore) Update(_ context.Context, p monitor.UpdateParams) (domain.Mo
 func (f *fakeStore) SoftDelete(_ context.Context, id uuid.UUID) error {
 	f.deletedID = &id
 	return f.err
+}
+
+func (f *fakeStore) RequestCheck(_ context.Context, id uuid.UUID) (domain.Monitor, error) {
+	f.requestedID = &id
+	if f.err != nil {
+		return domain.Monitor{}, f.err
+	}
+	return f.monitors[id], nil
+}
+
+func (f *fakeStore) ListChecks(_ context.Context, p monitor.ListChecksParams) ([]domain.Check, error) {
+	f.listChecksParams = &p
+	if f.err != nil {
+		return nil, f.err
+	}
+	if int(p.Limit) < len(f.checks) {
+		return f.checks[:p.Limit], nil
+	}
+	return f.checks, nil
 }
 
 func testDefaults() monitor.Defaults {

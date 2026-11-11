@@ -110,12 +110,7 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (domain.Monitor, error)
 // List returns one page of monitors along with the cursor for the next page,
 // which is nil once the last page has been returned.
 func (s *Service) List(ctx context.Context, limit int32, cursor *Cursor) ([]domain.Monitor, *Cursor, error) {
-	switch {
-	case limit <= 0:
-		limit = DefaultPageSize
-	case limit > MaxPageSize:
-		limit = MaxPageSize
-	}
+	limit = clampLimit(limit)
 
 	// One extra row answers "is there another page?" without a second query.
 	monitors, err := s.store.List(ctx, ListParams{Limit: limit + 1, Cursor: cursor})
@@ -130,6 +125,49 @@ func (s *Service) List(ctx context.Context, limit int32, cursor *Cursor) ([]doma
 	monitors = monitors[:limit]
 	last := monitors[len(monitors)-1]
 	return monitors, &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}, nil
+}
+
+// RequestCheck asks for a monitor to be checked as soon as a worker is free,
+// by making it due now. A missing or soft-deleted monitor is domain.ErrNotFound
+// and a disabled one is domain.ErrMonitorDisabled.
+//
+// The read and the update are not one transaction, and need not be: a monitor
+// disabled in between is merely made due, and the claim skips disabled
+// monitors, so no check runs.
+func (s *Service) RequestCheck(ctx context.Context, id uuid.UUID) (domain.Monitor, error) {
+	current, err := s.store.Get(ctx, id)
+	if err != nil {
+		return domain.Monitor{}, err
+	}
+	if !current.Enabled {
+		return domain.Monitor{}, domain.ErrMonitorDisabled
+	}
+	return s.store.RequestCheck(ctx, id)
+}
+
+// ListChecks returns one page of a monitor's check history, newest first,
+// along with the cursor for the next page, which is nil on the last page. A
+// missing or soft-deleted monitor is domain.ErrNotFound, so that an empty page
+// always means "no checks yet" rather than "no such monitor".
+func (s *Service) ListChecks(ctx context.Context, id uuid.UUID, limit int32, cursor *CheckCursor) ([]domain.Check, *CheckCursor, error) {
+	if _, err := s.store.Get(ctx, id); err != nil {
+		return nil, nil, err
+	}
+
+	limit = clampLimit(limit)
+
+	checks, err := s.store.ListChecks(ctx, ListChecksParams{MonitorID: id, Limit: limit + 1, Cursor: cursor})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(checks) <= int(limit) {
+		return checks, nil, nil
+	}
+
+	checks = checks[:limit]
+	last := checks[len(checks)-1]
+	return checks, &CheckCursor{CheckedAt: last.CheckedAt, ID: last.ID}, nil
 }
 
 // Update merges the requested changes over the stored monitor and validates the
@@ -202,6 +240,19 @@ func DefaultsFromDurations(interval, timeout time.Duration) (Defaults, error) {
 		IntervalSeconds: int32(interval / time.Second),     // #nosec G115 -- bounded above
 		TimeoutMS:       int32(timeout / time.Millisecond), // #nosec G115 -- bounded above
 	}, nil
+}
+
+// clampLimit bounds a requested page size to [1, MaxPageSize], treating a
+// non-positive value as a request for the default.
+func clampLimit(limit int32) int32 {
+	switch {
+	case limit <= 0:
+		return DefaultPageSize
+	case limit > MaxPageSize:
+		return MaxPageSize
+	default:
+		return limit
+	}
 }
 
 func deref[T any](p *T, fallback T) T {

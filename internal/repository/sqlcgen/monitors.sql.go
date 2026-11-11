@@ -176,6 +176,43 @@ func (q *Queries) ListMonitors(ctx context.Context, arg ListMonitorsParams) ([]M
 	return items, nil
 }
 
+const requestCheck = `-- name: RequestCheck :one
+UPDATE monitors SET next_check_at = now()
+WHERE id = $1 AND deleted_at IS NULL
+RETURNING id, name, url, interval_seconds, timeout_ms, expected_status_min, expected_status_max, failure_threshold, enabled, state, consecutive_failures, last_checked_at, last_status_code, last_latency_ms, next_check_at, lease_owner, lease_until, created_at, updated_at, deleted_at
+`
+
+// Manual check: makes the monitor due now, so the next worker poll claims it.
+// The enabled flag is checked by the service beforehand; a monitor disabled in
+// between is harmless because ClaimDueMonitors filters on enabled.
+func (q *Queries) RequestCheck(ctx context.Context, id uuid.UUID) (Monitor, error) {
+	row := q.db.QueryRow(ctx, requestCheck, id)
+	var i Monitor
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Url,
+		&i.IntervalSeconds,
+		&i.TimeoutMs,
+		&i.ExpectedStatusMin,
+		&i.ExpectedStatusMax,
+		&i.FailureThreshold,
+		&i.Enabled,
+		&i.State,
+		&i.ConsecutiveFailures,
+		&i.LastCheckedAt,
+		&i.LastStatusCode,
+		&i.LastLatencyMs,
+		&i.NextCheckAt,
+		&i.LeaseOwner,
+		&i.LeaseUntil,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
 const softDeleteMonitor = `-- name: SoftDeleteMonitor :one
 UPDATE monitors
 SET deleted_at  = now(),

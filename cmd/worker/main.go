@@ -1,7 +1,6 @@
-// Command worker runs the claim-and-check loop. Sprint 1 establishes the
-// process skeleton — configuration, logging, database pool, ticker, and
-// graceful shutdown — while the claim transaction and the HTTP checker are
-// added in Sprint 3.
+// Command worker runs the claim-and-check loop: it claims due monitors with
+// time-bounded leases, checks them with bounded concurrency, records the
+// results, and drains in-flight checks on SIGINT/SIGTERM.
 package main
 
 import (
@@ -11,13 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/OzanAlpkaya/pulsego/internal/checker"
 	"github.com/OzanAlpkaya/pulsego/internal/config"
 	"github.com/OzanAlpkaya/pulsego/internal/repository"
+	"github.com/OzanAlpkaya/pulsego/internal/scheduler"
 	"github.com/OzanAlpkaya/pulsego/internal/telemetry"
 )
 
@@ -38,8 +37,9 @@ func run() error {
 	// and across restarts, because it becomes the monitors.lease_owner value.
 	workerID := newWorkerID()
 
-	log := telemetry.NewLogger(os.Stdout, cfg.LogLevel, cfg.ServiceName+"-worker", cfg.Environment).
-		With(slog.String("worker_id", workerID))
+	// The scheduler adds worker_id itself, so it gets the base logger.
+	baseLog := telemetry.NewLogger(os.Stdout, cfg.LogLevel, cfg.ServiceName+"-worker", cfg.Environment)
+	log := baseLog.With(slog.String("worker_id", workerID))
 	log.Info("starting", slog.Any("config", cfg))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -53,43 +53,23 @@ func run() error {
 
 	log.Info("database connected", slog.Int("max_conns", int(cfg.DB.MaxConns)))
 
-	// Returns once the signal context is cancelled. Sprint 3 adds the drain
-	// of in-flight checks here, bounded by cfg.ShutdownTimeout; with no work
-	// in flight yet there is nothing to wait for, and waiting anyway would
-	// only delay every restart.
-	loop(ctx, log, cfg, pool)
+	store := repository.NewSchedulerStore(pool)
+	chk := checker.New()
+	defer chk.CloseIdleConnections()
+
+	// Returns once the signal context is cancelled and every in-flight check
+	// has finished or, after cfg.ShutdownTimeout, been cancelled and released.
+	scheduler.New(store, chk, scheduler.Config{
+		WorkerID:        workerID,
+		Concurrency:     cfg.Worker.Concurrency,
+		BatchSize:       cfg.Worker.BatchSize,
+		PollInterval:    cfg.Worker.PollInterval,
+		LeaseDuration:   cfg.Worker.LeaseDuration,
+		ShutdownTimeout: cfg.ShutdownTimeout,
+	}, baseLog).Run(ctx)
 
 	log.Info("stopped")
 	return nil
-}
-
-// loop polls for due monitors until the context is cancelled.
-func loop(ctx context.Context, log *slog.Logger, cfg config.Config, pool *pgxpool.Pool) {
-	ticker := time.NewTicker(cfg.Worker.PollInterval)
-	defer ticker.Stop()
-
-	log.Info("poll loop started",
-		slog.Duration("interval", cfg.Worker.PollInterval),
-		slog.Int("concurrency", cfg.Worker.Concurrency),
-		slog.Int("batch_size", cfg.Worker.BatchSize),
-		slog.Duration("lease_duration", cfg.Worker.LeaseDuration),
-	)
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info("poll loop stopping")
-			return
-		case <-ticker.C:
-			// Sprint 3 replaces this with the FOR UPDATE SKIP LOCKED claim
-			// transaction followed by a bounded-concurrency check batch.
-			if err := pool.Ping(ctx); err != nil {
-				log.Error("database unreachable", slog.Any("error", err))
-				continue
-			}
-			log.Debug("poll tick")
-		}
-	}
 }
 
 // newWorkerID builds an identifier that ties a lease back to a specific

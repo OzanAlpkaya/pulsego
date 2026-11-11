@@ -30,6 +30,8 @@ type MonitorService interface {
 	List(ctx context.Context, limit int32, cursor *monitor.Cursor) ([]domain.Monitor, *monitor.Cursor, error)
 	Update(ctx context.Context, id uuid.UUID, in monitor.UpdateInput) (domain.Monitor, error)
 	Delete(ctx context.Context, id uuid.UUID) error
+	RequestCheck(ctx context.Context, id uuid.UUID) (domain.Monitor, error)
+	ListChecks(ctx context.Context, id uuid.UUID, limit int32, cursor *monitor.CheckCursor) ([]domain.Check, *monitor.CheckCursor, error)
 }
 
 // MonitorHandler serves the /v1/monitors resource.
@@ -52,6 +54,8 @@ func (h *MonitorHandler) Routes() chi.Router {
 	r.Get("/{monitorID}", h.get)
 	r.Patch("/{monitorID}", h.update)
 	r.Delete("/{monitorID}", h.delete)
+	r.Post("/{monitorID}/checks", h.requestCheck)
+	r.Get("/{monitorID}/checks", h.listChecks)
 
 	return r
 }
@@ -259,6 +263,8 @@ func (h *MonitorHandler) writeServiceError(w http.ResponseWriter, r *http.Reques
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
 		problemNotFound(w, r, h.log, "no monitor exists with that id")
+	case errors.Is(err, domain.ErrMonitorDisabled):
+		problemMonitorDisabled(w, r, h.log)
 	case errors.As(err, &verr):
 		problemValidation(w, r, h.log, verr)
 	default:

@@ -70,3 +70,11 @@ SET deleted_at  = now(),
 WHERE id = $1
   AND deleted_at IS NULL
 RETURNING id;
+
+-- Manual check: makes the monitor due now, so the next worker poll claims it.
+-- The enabled flag is checked by the service beforehand; a monitor disabled in
+-- between is harmless because ClaimDueMonitors filters on enabled.
+-- name: RequestCheck :one
+UPDATE monitors SET next_check_at = now()
+WHERE id = $1 AND deleted_at IS NULL
+RETURNING *;
