@@ -1,0 +1,26 @@
+# OpenTelemetry Collector for the Compose `observability` profile.
+# api and worker export OTLP/HTTP here when OTEL_ENABLED=true; the collector
+# batches spans and forwards them to Jaeger over OTLP/gRPC.
+receivers:
+  otlp:
+    protocols:
+      http:
+        # Recent collectors bind to localhost by default, which other
+        # containers cannot reach.
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp]

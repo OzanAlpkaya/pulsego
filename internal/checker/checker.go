@@ -5,18 +5,27 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
+	"net/url"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
+	"github.com/OzanAlpkaya/pulsego/internal/telemetry"
 )
 
+// spanCheck is the client span around one check (Sprint 5 D4). It carries the
+// target host only: the path and query of a monitor URL may hold secrets.
+const spanCheck = "checker.check"
+
 // Transport and request tuning. These are deliberately constants rather than
-// configuration: they bound resource use per worker, not per monitor.
+// configuration: they bound resource use per worker, not per monitor. Dial
+// timeouts live in internal/security, whose Dialer the transport uses.
 const (
-	DialTimeout           = 10 * time.Second
-	DialKeepAlive         = 30 * time.Second
 	TLSHandshakeTimeout   = 10 * time.Second
 	MaxIdleConns          = 100
 	MaxIdleConnsPerHost   = 4
@@ -28,48 +37,50 @@ const (
 	expectedRangeTemplate = "status %d outside expected range %d-%d"
 )
 
-// ErrTooManyRedirects is returned by the redirect policy once a check has
-// followed MaxRedirects redirects. It is classified as redirect.
-var ErrTooManyRedirects = fmt.Errorf("stopped after %d redirects", MaxRedirects)
-
-// DialContextFunc dials a network connection. It is the hook through which a
-// validating (SSRF-safe) dialer replaces the default one.
-type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
-
 // Option configures a Checker.
 type Option func(*options)
 
 type options struct {
-	dial DialContextFunc
+	dialerOpts     []security.DialerOption
+	tracerProvider trace.TracerProvider
 }
 
-// WithDialContext replaces the transport's dialer. The function must honour
-// ctx; DialTimeout is not applied to a custom dialer.
-func WithDialContext(dial DialContextFunc) Option {
-	return func(o *options) { o.dial = dial }
+// WithTracerProvider records checker.check spans on tp instead of the global
+// provider. It exists for tests.
+func WithTracerProvider(tp trace.TracerProvider) Option {
+	return func(o *options) { o.tracerProvider = tp }
+}
+
+// WithDialerOptions passes options (a test resolver or inner dial) to the
+// SSRF-validating dialer. They cannot remove the validation itself.
+func WithDialerOptions(opts ...security.DialerOption) Option {
+	return func(o *options) { o.dialerOpts = append(o.dialerOpts, opts...) }
 }
 
 // Checker runs HTTP checks. It is safe for concurrent use; create one per
 // process so all checks share its connection pool.
 type Checker struct {
+	policy    security.Policy
 	transport *http.Transport
 	client    *http.Client
+	// tracerProvider is nil for the global provider, looked up per span.
+	tracerProvider trace.TracerProvider
 }
 
-// New builds a Checker with the shared transport.
-func New(opts ...Option) *Checker {
+// New builds a Checker with the shared transport. policy is required so an
+// unprotected checker cannot be built by accident: every connection goes
+// through security.Dialer, and every redirect hop through
+// security.RedirectPolicy.
+func New(policy security.Policy, opts ...Option) *Checker {
 	o := options{}
 	for _, opt := range opts {
 		opt(&o)
 	}
-	if o.dial == nil {
-		dialer := &net.Dialer{Timeout: DialTimeout, KeepAlive: DialKeepAlive}
-		o.dial = dialer.DialContext
-	}
+	dialer := security.NewDialer(policy, o.dialerOpts...)
 
 	transport := &http.Transport{
 		Proxy:               nil, // ignore HTTP(S)_PROXY from the environment
-		DialContext:         o.dial,
+		DialContext:         dialer.DialContext,
 		TLSHandshakeTimeout: TLSHandshakeTimeout,
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
@@ -78,28 +89,21 @@ func New(opts ...Option) *Checker {
 	}
 
 	return &Checker{
-		transport: transport,
+		policy:         policy,
+		tracerProvider: o.tracerProvider,
+		transport:      transport,
 		client: &http.Client{
 			Transport: transport,
 			// No client-wide timeout: the per-check context deadline is the
 			// only time limit.
 			Timeout:       0,
-			CheckRedirect: checkRedirect,
+			CheckRedirect: security.RedirectPolicy(policy, MaxRedirects),
 		},
 	}
 }
 
 // CloseIdleConnections closes pooled connections that are not in use.
 func (c *Checker) CloseIdleConnections() { c.transport.CloseIdleConnections() }
-
-func checkRedirect(_ *http.Request, via []*http.Request) error {
-	// via holds every request already sent, so the request about to be sent
-	// is redirect number len(via).
-	if len(via) > MaxRedirects {
-		return ErrTooManyRedirects
-	}
-	return nil
-}
 
 // Check performs one GET against m.URL under m.Timeout().
 //
@@ -111,10 +115,51 @@ func (c *Checker) Check(ctx context.Context, m domain.Monitor) (domain.CheckOutc
 		return domain.CheckOutcome{}, err
 	}
 
+	ctx, span := telemetry.TracerFrom(c.tracerProvider).Start(ctx, spanCheck,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("http.request.method", http.MethodGet)))
+	defer span.End()
+	if host := urlHost(m.URL); host != "" {
+		span.SetAttributes(attribute.String("server.address", host))
+	}
+
+	out, err := c.check(ctx, m)
+	switch {
+	case err != nil:
+		span.SetStatus(codes.Error, "check cancelled")
+	default:
+		if out.StatusCode != nil {
+			span.SetAttributes(attribute.Int("http.response.status_code", int(*out.StatusCode)))
+		}
+		if !out.Success && out.ErrorKind != nil {
+			// The kind only: the error message may quote the target.
+			span.SetAttributes(attribute.String("pulsego.error_kind", out.ErrorKind.String()))
+			span.SetStatus(codes.Error, out.ErrorKind.String())
+		}
+	}
+	return out, err
+}
+
+// urlHost returns the host name of raw without port, path, query or userinfo,
+// or "" if raw does not parse.
+func urlHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+func (c *Checker) check(ctx context.Context, m domain.Monitor) (domain.CheckOutcome, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, m.Timeout())
 	defer cancel()
 
 	start := time.Now()
+	// Static validation first, so a blocked URL is never dialled. The dialer
+	// still checks every resolved address.
+	if err := c.policy.ValidateURL(m.URL); err != nil {
+		return failure(classify(err), errorMessage(err), time.Since(start)), nil
+	}
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, m.URL, nil)
 	if err != nil {
 		return failure(domain.ErrorKindUnknown, errorMessage(err), time.Since(start)), nil

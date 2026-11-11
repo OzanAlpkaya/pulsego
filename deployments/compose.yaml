@@ -3,6 +3,17 @@ name: pulsego
 # `docker compose up` brings up the whole stack: postgres, a one-shot
 # migration run, then the api and worker. The services never migrate
 # themselves, so scaling the worker cannot race on the schema.
+#
+# `docker compose --profile observability up` additionally starts an
+# OpenTelemetry Collector, Jaeger, Prometheus and Grafana:
+#   Jaeger UI   http://localhost:16686
+#   Prometheus  http://localhost:9092
+#   Grafana     http://localhost:3000   (anonymous viewer access)
+# Prometheus scrapes api and worker without any change to the app. Tracing
+# stays off by default; to export traces to the collector, start with
+#   OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+#     docker compose -f deployments/compose.yaml --profile observability up
+# An unreachable collector never blocks startup or requests.
 
 x-app-env: &app-env
   SERVICE_NAME: ${SERVICE_NAME:-pulsego}
@@ -59,6 +70,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # The image's HEALTHCHECK probes :9090, which a one-shot job never serves.
+    healthcheck:
+      disable: true
     restart: "no"
 
   api:
@@ -76,7 +90,7 @@ services:
     healthcheck:
       # A real GET, not --spider: the latter sends HEAD and would only prove
       # the port is open rather than that the handler responds.
-      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:9090/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-T", "2", "http://127.0.0.1:9090/healthz"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -92,6 +106,61 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    # Same probe as the api: the worker serves /healthz on its internal
+    # listener. Port 9090 is not published, Prometheus reaches it in-network.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-T", "2", "http://127.0.0.1:9090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # --- Profile: observability ----------------------------------------------
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    profiles: ["observability"]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  # Jaeger v2 all-in-one with in-memory storage; receives OTLP gRPC on 4317
+  # from the collector.
+  jaeger:
+    image: jaegertracing/jaeger:2.7.0
+    profiles: ["observability"]
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      # Host 9090 is the api internal port and 9091 is `make run-worker`.
+      - "${PROMETHEUS_PORT:-9092}:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
     restart: unless-stopped
 
 volumes:

@@ -100,7 +100,7 @@ func TestLoadFromOverrides(t *testing.T) {
 	env["CHECK_RETENTION_DAYS"] = "7"
 	env["SHUTDOWN_TIMEOUT"] = "30s"
 	env["OTEL_ENABLED"] = "true"
-	env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://otel-collector:4317"
+	env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://otel-collector:4318"
 
 	cfg, err := config.LoadFrom(lookupFrom(env))
 	if err != nil {
@@ -238,6 +238,46 @@ func TestLoadFromInvalid(t *testing.T) {
 			wantText: "OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED is true",
 		},
 		{
+			name: "otel endpoint without scheme",
+			mutate: func(env map[string]string) {
+				env["OTEL_ENABLED"] = "true"
+				env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "otel-collector:4318"
+			},
+			wantText: `OTEL_EXPORTER_OTLP_ENDPOINT must use the http:// or https:// scheme, got "otel-collector"`,
+		},
+		{
+			name: "otel endpoint with grpc scheme",
+			mutate: func(env map[string]string) {
+				env["OTEL_ENABLED"] = "true"
+				env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "grpc://otel-collector:4317"
+			},
+			wantText: `OTEL_EXPORTER_OTLP_ENDPOINT must use the http:// or https:// scheme, got "grpc"`,
+		},
+		{
+			name: "otel endpoint without host",
+			mutate: func(env map[string]string) {
+				env["OTEL_ENABLED"] = "true"
+				env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http:///v1/traces"
+			},
+			wantText: "OTEL_EXPORTER_OTLP_ENDPOINT must include a host",
+		},
+		{
+			name: "otel endpoint with port only",
+			mutate: func(env map[string]string) {
+				env["OTEL_ENABLED"] = "true"
+				env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://:4318"
+			},
+			wantText: "OTEL_EXPORTER_OTLP_ENDPOINT must include a host",
+		},
+		{
+			name: "otel endpoint unparsable",
+			mutate: func(env map[string]string) {
+				env["OTEL_ENABLED"] = "true"
+				env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://otel collector:4318"
+			},
+			wantText: "OTEL_EXPORTER_OTLP_ENDPOINT is not a valid URL",
+		},
+		{
 			name: "private targets allowed outside development",
 			mutate: func(env map[string]string) {
 				env["ENVIRONMENT"] = config.EnvProduction
@@ -334,5 +374,41 @@ func TestDBMaxConnsCoversWorkerConcurrency(t *testing.T) {
 
 	if got, want := cfg.DB.MaxConns, int32(66); got != want {
 		t.Errorf("DB.MaxConns = %d, want %d", got, want)
+	}
+}
+
+// TestLoadFromAcceptsOTLPEndpoints pins the endpoint forms that must load:
+// plain and TLS collectors, a base path behind a gateway, and any value at all
+// while tracing is disabled, because the endpoint is unused then.
+func TestLoadFromAcceptsOTLPEndpoints(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		enabled  string
+		endpoint string
+	}{
+		{name: "http collector", enabled: "true", endpoint: "http://localhost:4318"},
+		{name: "https with base path", enabled: "true", endpoint: "https://otel.example.com/otlp"},
+		{name: "ip literal", enabled: "true", endpoint: "http://10.0.0.5:4318"},
+		{name: "disabled ignores invalid endpoint", enabled: "false", endpoint: "not a url"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := validEnv()
+			env["OTEL_ENABLED"] = tt.enabled
+			env["OTEL_EXPORTER_OTLP_ENDPOINT"] = tt.endpoint
+
+			cfg, err := config.LoadFrom(lookupFrom(env))
+			if err != nil {
+				t.Fatalf("LoadFrom() returned an unexpected error: %v", err)
+			}
+			if got := cfg.Telemetry.OTLPEndpoint; got != tt.endpoint {
+				t.Errorf("Telemetry.OTLPEndpoint = %q, want %q", got, tt.endpoint)
+			}
+		})
 	}
 }

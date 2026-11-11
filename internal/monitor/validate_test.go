@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // validAttrs is the baseline every case mutates one field of.
@@ -39,7 +41,8 @@ func TestAttributesValidateAcceptsBoundaries(t *testing.T) {
 		{name: "multibyte name counted in runes", mutate: func(a *attributes) { a.name = strings.Repeat("ü", 120) }},
 		{name: "http scheme", mutate: func(a *attributes) { a.rawURL = "http://example.com" }},
 		{name: "url with query", mutate: func(a *attributes) { a.rawURL = "https://example.com/x?a=1&b=2" }},
-		{name: "url with port", mutate: func(a *attributes) { a.rawURL = "https://example.com:8443/health" }},
+		{name: "url with default https port", mutate: func(a *attributes) { a.rawURL = "https://example.com:443/health" }},
+		{name: "public IP literal", mutate: func(a *attributes) { a.rawURL = "http://93.184.215.14/" }},
 		{name: "surrounding whitespace is tolerated", mutate: func(a *attributes) { a.name = "  Example  " }},
 	}
 
@@ -50,7 +53,7 @@ func TestAttributesValidateAcceptsBoundaries(t *testing.T) {
 			a := validAttrs()
 			tt.mutate(&a)
 
-			if err := a.validate(); err != nil {
+			if err := a.validate(security.Policy{}); err != nil {
 				t.Errorf("validate() returned an unexpected error: %v", err)
 			}
 		})
@@ -180,7 +183,7 @@ func TestAttributesValidateRejects(t *testing.T) {
 			a := validAttrs()
 			tt.mutate(&a)
 
-			err := a.validate()
+			err := a.validate(security.Policy{})
 			if err == nil {
 				t.Fatalf("validate() succeeded, want a rejection of %s", tt.wantField)
 			}
@@ -215,7 +218,7 @@ func TestValidateReportsEveryField(t *testing.T) {
 		failureThreshold:  99,
 	}
 
-	err := a.validate()
+	err := a.validate(security.Policy{})
 	if err == nil {
 		t.Fatal("validate() succeeded, want an error")
 	}
@@ -237,5 +240,48 @@ func TestValidateReportsEveryField(t *testing.T) {
 		if !seen[want] {
 			t.Errorf("no error reported for %q; got %+v", want, verr.Fields)
 		}
+	}
+}
+
+// TestValidateURLAppliesSSRFPolicy covers the static SSRF check on the url
+// field: rejected under the production policy, accepted (bar the rules that
+// always apply) under the development one.
+func TestValidateURLAppliesSSRFPolicy(t *testing.T) {
+	t.Parallel()
+
+	private := []string{
+		"http://127.0.0.1/",
+		"http://[::1]/",
+		"http://[::ffff:127.0.0.1]/",
+		"http://localhost:80/",
+		"http://app.localhost/",
+		"http://10.0.0.1/",
+		"http://172.16.0.1/",
+		"http://192.168.1.1/",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://127.1/",
+		"http://2130706433/",
+		"https://example.com:8443/health",
+	}
+	for _, raw := range private {
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+
+			a := validAttrs()
+			a.rawURL = raw
+			err := a.validate(security.Policy{})
+			var verr *ValidationError
+			if !errors.As(err, &verr) {
+				t.Fatalf("validate(strict) = %v, want a *ValidationError", err)
+			}
+			if len(verr.Fields) != 1 || verr.Fields[0].Field != "url" ||
+				!strings.Contains(verr.Fields[0].Message, "must be a public host") {
+				t.Fatalf("fields = %+v, want one url error", verr.Fields)
+			}
+
+			if err := a.validate(security.Policy{AllowPrivate: true}); err != nil {
+				t.Fatalf("validate(AllowPrivate) = %v, want nil", err)
+			}
+		})
 	}
 }

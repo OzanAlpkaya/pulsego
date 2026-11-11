@@ -18,6 +18,7 @@ import (
 	"github.com/OzanAlpkaya/pulsego/internal/checker"
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/scheduler"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 const (
@@ -45,6 +46,8 @@ type fakeStore struct {
 	recordErr    error
 	// change is what every successful Record returns.
 	change domain.StateChange
+	// lag sets each claimed monitor's NextCheckAt to claim time minus lag.
+	lag time.Duration
 }
 
 func newFakeStore(supply int) *fakeStore {
@@ -72,7 +75,7 @@ func (f *fakeStore) Claim(_ context.Context, workerID string, batchSize int32, _
 			TimeoutMS:         5000,
 			ExpectedStatusMin: 200,
 			ExpectedStatusMax: 399,
-			NextCheckAt:       time.Now(),
+			NextCheckAt:       time.Now().Add(-f.lag),
 		}
 	}
 	return out, nil
@@ -175,17 +178,23 @@ type harness struct {
 // cancel and wait on done) before it ends.
 func start(t *testing.T, store scheduler.Store, chk scheduler.Checker, concurrency, batch int, shutdown time.Duration) *harness {
 	t.Helper()
-
-	logs := &syncBuffer{}
-	log := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	s := scheduler.New(store, chk, scheduler.Config{
+	return startWith(t, store, chk, scheduler.Config{
 		WorkerID:        testWorkerID,
 		Concurrency:     concurrency,
 		BatchSize:       batch,
 		PollInterval:    testPoll,
 		LeaseDuration:   time.Minute,
 		ShutdownTimeout: shutdown,
-	}, log)
+	})
+}
+
+// startWith is start with a full Config, for the optional fields.
+func startWith(t *testing.T, store scheduler.Store, chk scheduler.Checker, cfg scheduler.Config) *harness {
+	t.Helper()
+
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := scheduler.New(store, chk, cfg, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &harness{logs: logs, cancel: cancel, done: make(chan struct{})}
@@ -388,7 +397,7 @@ func TestConcurrencyBound(t *testing.T) {
 
 	store := newFakeStore(total)
 	store.url = srv.URL
-	chk := checker.New()
+	chk := checker.New(security.Policy{AllowPrivate: true}) // httptest target on loopback
 	t.Cleanup(chk.CloseIdleConnections)
 	h := start(t, store, chk, concurrency, batch, waitLimit)
 

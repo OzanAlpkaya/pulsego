@@ -10,7 +10,7 @@ func TestErrorKindValid(t *testing.T) {
 	t.Parallel()
 
 	kinds := domain.ErrorKinds()
-	if got, want := len(kinds), 7; got != want {
+	if got, want := len(kinds), 8; got != want {
 		t.Fatalf("len(ErrorKinds()) = %d, want %d", got, want)
 	}
 	for _, kind := range kinds {

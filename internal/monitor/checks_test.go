@@ -10,6 +10,7 @@ import (
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/monitor"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 func TestRequestCheck(t *testing.T) {
@@ -21,7 +22,7 @@ func TestRequestCheck(t *testing.T) {
 		id := uuid.New()
 		store := newFakeStore()
 		store.monitors[id] = domain.Monitor{ID: id, Enabled: true}
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, err := svc.RequestCheck(context.Background(), id)
 		if err != nil {
@@ -39,7 +40,7 @@ func TestRequestCheck(t *testing.T) {
 		t.Parallel()
 
 		store := newFakeStore()
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		_, err := svc.RequestCheck(context.Background(), uuid.New())
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -56,7 +57,7 @@ func TestRequestCheck(t *testing.T) {
 		id := uuid.New()
 		store := newFakeStore()
 		store.monitors[id] = domain.Monitor{ID: id, Enabled: false}
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		_, err := svc.RequestCheck(context.Background(), id)
 		if !errors.Is(err, domain.ErrMonitorDisabled) {
@@ -94,7 +95,7 @@ func TestListChecksPagination(t *testing.T) {
 
 		store, id := withMonitor()
 		store.checks = makeChecks(id, 4)
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		cursor := &monitor.CheckCursor{CheckedAt: base.Add(time.Hour), ID: 500}
 		got, next, err := svc.ListChecks(context.Background(), id, 3, cursor)
@@ -127,7 +128,7 @@ func TestListChecksPagination(t *testing.T) {
 
 		store, id := withMonitor()
 		store.checks = makeChecks(id, 2)
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, next, err := svc.ListChecks(context.Background(), id, 3, nil)
 		if err != nil {
@@ -142,7 +143,7 @@ func TestListChecksPagination(t *testing.T) {
 		t.Parallel()
 
 		store, id := withMonitor()
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, next, err := svc.ListChecks(context.Background(), id, 3, nil)
 		if err != nil {
@@ -157,7 +158,7 @@ func TestListChecksPagination(t *testing.T) {
 		t.Parallel()
 
 		store := newFakeStore()
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		_, _, err := svc.ListChecks(context.Background(), uuid.New(), 3, nil)
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -176,7 +177,7 @@ func TestListChecksPagination(t *testing.T) {
 			{requested: 1000, want: monitor.MaxPageSize},
 		} {
 			store, id := withMonitor()
-			svc := monitor.NewService(store, testDefaults())
+			svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 			if _, _, err := svc.ListChecks(context.Background(), id, tc.requested, nil); err != nil {
 				t.Fatalf("ListChecks() returned an unexpected error: %v", err)

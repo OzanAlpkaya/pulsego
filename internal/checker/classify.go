@@ -11,13 +11,19 @@ import (
 	"syscall"
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // classify maps a transport error to an error kind. The caller has already
 // ruled out cancellation of its own context. The order of the checks is part
-// of the contract: a DNS lookup cut off by the deadline is a timeout, and a
-// TLS failure wrapped in a *net.OpError is tls, not connection.
+// of the contract: an SSRF rejection is blocked whatever else it wraps, a DNS
+// lookup cut off by the deadline is a timeout, and a TLS failure wrapped in a
+// *net.OpError is tls, not connection.
 func classify(err error) domain.ErrorKind {
+	if errors.Is(err, security.ErrBlockedTarget) {
+		return domain.ErrorKindBlocked
+	}
+
 	var netErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
 		return domain.ErrorKindTimeout
@@ -28,7 +34,7 @@ func classify(err error) domain.ErrorKind {
 		return domain.ErrorKindDNS
 	}
 
-	if errors.Is(err, ErrTooManyRedirects) {
+	if errors.Is(err, security.ErrTooManyRedirects) {
 		return domain.ErrorKindRedirect
 	}
 

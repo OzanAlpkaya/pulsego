@@ -16,6 +16,7 @@ import (
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/repository"
 	"github.com/OzanAlpkaya/pulsego/internal/scheduler"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // TestSchedulerEndToEnd runs the real scheduler, checker and SchedulerStore
@@ -43,7 +44,7 @@ func TestSchedulerEndToEnd(t *testing.T) {
 	}
 
 	const poll = 500 * time.Millisecond
-	chk := checker.New()
+	chk := checker.New(security.Policy{AllowPrivate: true}) // httptest target on loopback
 	t.Cleanup(chk.CloseIdleConnections)
 	s := scheduler.New(repository.NewSchedulerStore(sharedPool), chk, scheduler.Config{
 		WorkerID:        "e2e-worker",

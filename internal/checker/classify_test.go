@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // wrapURL wraps err the way http.Client.Do does.
@@ -48,7 +49,8 @@ func TestClassify(t *testing.T) {
 		{"dns timeout via deadline", wrapURL(&net.DNSError{Err: context.DeadlineExceeded.Error(), Name: "example.com", UnwrapErr: context.DeadlineExceeded}), domain.ErrorKindTimeout},
 		{"dns not found", wrapURL(&net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", Name: "nope.invalid", IsNotFound: true}}), domain.ErrorKindDNS},
 		{"dns bare", &net.DNSError{Err: "server misbehaving", Name: "example.com"}, domain.ErrorKindDNS},
-		{"redirect", wrapURL(ErrTooManyRedirects), domain.ErrorKindRedirect},
+		{"redirect", wrapURL(fmt.Errorf("%w: stopped after 5", security.ErrTooManyRedirects)), domain.ErrorKindRedirect},
+		{"blocked", wrapURL(fmt.Errorf("%w: loopback", security.ErrBlockedTarget)), domain.ErrorKindBlocked},
 		{"cert verification", wrapURL(&tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}), domain.ErrorKindTLS},
 		{"x509 hostname", wrapURL(x509.HostnameError{Host: "example.com", Certificate: &x509.Certificate{}}), domain.ErrorKindTLS},
 		{"x509 invalid", wrapURL(x509.CertificateInvalidError{Reason: x509.Expired, Cert: &x509.Certificate{}}), domain.ErrorKindTLS},

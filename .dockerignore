@@ -10,3 +10,10 @@ web
 coverage.out
 *.log
 deployments/compose.yaml
+.env.*
+!.env.example
+*.test
+/worker
+/migrate
+.idea
+.vscode

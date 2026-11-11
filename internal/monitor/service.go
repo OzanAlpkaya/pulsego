@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // Pagination bounds for List.
@@ -33,11 +34,13 @@ type Defaults struct {
 type Service struct {
 	store    Store
 	defaults Defaults
+	policy   security.Policy
 }
 
-// NewService wires a service to its store.
-func NewService(store Store, defaults Defaults) *Service {
-	return &Service{store: store, defaults: defaults}
+// NewService wires a service to its store. policy (from
+// ALLOW_PRIVATE_TARGETS) is applied to the url of every create and update.
+func NewService(store Store, defaults Defaults, policy security.Policy) *Service {
+	return &Service{store: store, defaults: defaults, policy: policy}
 }
 
 // CreateInput is a create request. Pointer fields are optional and fall back to
@@ -85,7 +88,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Monitor, e
 		failureThreshold:  deref(in.FailureThreshold, domain.DefaultFailureThreshold),
 	}
 
-	if err := attrs.validate(); err != nil {
+	if err := attrs.validate(s.policy); err != nil {
 		return domain.Monitor{}, err
 	}
 
@@ -228,9 +231,12 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (dom
 		expectedStatusMin: deref(in.ExpectedStatusMin, current.ExpectedStatusMin),
 		expectedStatusMax: deref(in.ExpectedStatusMax, current.ExpectedStatusMax),
 		failureThreshold:  deref(in.FailureThreshold, current.FailureThreshold),
+		// Only a URL the request sets has to pass the SSRF policy; a stored
+		// one that predates it must not stop the monitor being disabled.
+		skipPolicy: in.URL == nil,
 	}
 
-	if err := attrs.validate(); err != nil {
+	if err := attrs.validate(s.policy); err != nil {
 		return domain.Monitor{}, err
 	}
 

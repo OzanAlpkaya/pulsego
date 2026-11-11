@@ -7,7 +7,7 @@ info:
     Uptime monitoring API. Register HTTP/HTTPS endpoints as monitors; background
     workers check them on a schedule and record availability and latency.
 
-    All `/v1` endpoints require a bearer API key. The health endpoint is
+    All `/v1` endpoints require a bearer API key. The health endpoints are
     deliberately unauthenticated so that probes need no credential.
 
     Errors are returned as `application/problem+json` (RFC 7807). Every error
@@ -32,7 +32,7 @@ tags:
   - name: stats
     description: Uptime and latency summaries
   - name: health
-    description: Liveness
+    description: Liveness and readiness
 
 paths:
   /healthz:
@@ -42,7 +42,7 @@ paths:
       description: |
         Reports that the process is running. Performs no database query, so an
         unreachable database does not make a healthy process look dead.
-        Readiness, which does verify PostgreSQL, arrives in Sprint 5.
+        Readiness, which does verify PostgreSQL, is `/readyz`.
       security: []
       operationId: getHealthz
       responses:
@@ -57,6 +57,31 @@ paths:
                   status:
                     type: string
                     const: ok
+
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      description: |
+        Reports whether the service can handle traffic: pings PostgreSQL with a
+        2 second timeout. Use it to route traffic, not to restart the process;
+        `/healthz` is the liveness probe. Also answers HEAD.
+      security: []
+      operationId: getReadyz
+      responses:
+        "200":
+          description: The service and its database are reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ready
+        "503":
+          $ref: "#/components/responses/NotReady"
 
   /v1/monitors:
     post:
@@ -462,6 +487,15 @@ components:
           schema:
             $ref: "#/components/schemas/Problem"
 
+    NotReady:
+      description: |
+        A dependency, currently PostgreSQL, is unreachable. The problem type is
+        `urn:pulsego:problem:not-ready`; the cause is logged, never returned.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
   schemas:
     Problem:
       type: object
@@ -608,7 +642,11 @@ components:
             failure.
         error_kind:
           type: [string, "null"]
-          enum: [timeout, dns, connection, tls, redirect, unexpected_status, unknown, null]
+          enum: [timeout, dns, connection, tls, redirect, unexpected_status, blocked, unknown, null]
+          description: |
+            `blocked` means the SSRF policy refused the target or a redirect
+            hop (a non-public address, a port other than 80/443, or a URL the
+            policy rejects) before any connection was made to it.
         error_message:
           type: [string, "null"]
           maxLength: 512
@@ -756,8 +794,14 @@ components:
           maxLength: 2048
           description: |
             Must use http or https, must not embed credentials, and must not
-            include a fragment. Whether the target address is safe to contact is
-            enforced separately at check time.
+            include a fragment. Private targets are rejected with 422: literal
+            loopback, private, link-local, CGNAT, multicast, documentation and
+            other reserved addresses, `localhost`, ambiguous numeric hosts such
+            as `127.1`, and ports other than 80 and 443 (unless the server runs
+            with `ALLOW_PRIVATE_TARGETS=true`, development only). Host names are
+            not resolved here; their resolved addresses are checked on every
+            check and every redirect hop, and a refused target is recorded with
+            `error_kind` `blocked`.
         interval_seconds:
           type: integer
           minimum: 10
@@ -799,6 +843,7 @@ components:
           type: string
           format: uri
           maxLength: 2048
+          description: Same rules as on create; private targets are rejected with 422.
         interval_seconds:
           type: integer
           minimum: 10

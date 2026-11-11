@@ -125,10 +125,10 @@ func TestOpenAPIMatchesRouter(t *testing.T) {
 	documented := documentedOperations(t, doc)
 	implemented := implementedOperations(t)
 
-	// healthz, the five monitor operations, the two check operations, the
+	// healthz, readyz, the five monitor operations, the two check operations, the
 	// incident history, and the stats. A change here is a change to the API
 	// surface and should be deliberate.
-	if got, want := len(implemented), 10; got != want {
+	if got, want := len(implemented), 11; got != want {
 		t.Errorf("router implements %d operations, want %d: %v", got, want, implemented)
 	}
 
@@ -183,17 +183,21 @@ func TestHealthIsDocumentedAsUnauthenticated(t *testing.T) {
 
 	doc := loadOpenAPI(t)
 
-	node, ok := doc.Paths["/healthz"]["get"]
-	if !ok {
-		t.Fatal("/healthz is not documented")
-	}
+	for _, path := range []string{"/healthz", "/readyz"} {
+		node, ok := doc.Paths[path]["get"]
+		if !ok {
+			t.Errorf("%s is not documented", path)
+			continue
+		}
 
-	get := decodeOperation(t, node)
-	if get.Security == nil {
-		t.Fatal("/healthz does not override the global security requirement")
-	}
-	if len(*get.Security) != 0 {
-		t.Errorf("/healthz security = %v, want an empty list meaning no auth", *get.Security)
+		get := decodeOperation(t, node)
+		if get.Security == nil {
+			t.Errorf("%s does not override the global security requirement", path)
+			continue
+		}
+		if len(*get.Security) != 0 {
+			t.Errorf("%s security = %v, want an empty list meaning no auth", path, *get.Security)
+		}
 	}
 }
 

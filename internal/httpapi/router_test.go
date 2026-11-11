@@ -16,7 +16,7 @@ func TestHealthz(t *testing.T) {
 
 	routers := map[string]http.Handler{
 		"public":   newTestRouter(t, &stubService{}),
-		"internal": httpapi.NewInternalRouter(),
+		"internal": httpapi.NewInternalRouter(httpapi.InternalConfig{}, slog.New(slog.DiscardHandler)),
 	}
 
 	for name, router := range routers {

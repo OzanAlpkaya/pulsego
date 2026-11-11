@@ -5,6 +5,8 @@ package repository_test
 import (
 	"strings"
 	"testing"
+
+	"github.com/OzanAlpkaya/pulsego/internal/domain"
 )
 
 // TestMonitorChecksConstraints checks that every bound internal/domain/check.go
@@ -59,6 +61,20 @@ func TestMonitorChecksConstraints(t *testing.T) {
 	for name, r := range map[string]row{"success": success, "failure": failure, "longest message": longest, "unexpected status": unexpected} {
 		if err := exec(t, r); err != nil {
 			t.Fatalf("valid %s check was rejected: %v", name, err)
+		}
+	}
+
+	// Every kind the domain declares must be storable; this is what keeps the
+	// constraint and domain.ErrorKinds() in step (including 'blocked', added
+	// by migration 00005).
+	for _, kind := range domain.ErrorKinds() {
+		r := failure
+		r.errorKind = str(string(kind))
+		if kind == domain.ErrorKindUnexpectedStatus {
+			r.statusCode = ptr(503)
+		}
+		if err := exec(t, r); err != nil {
+			t.Errorf("error kind %q was rejected: %v", kind, err)
 		}
 	}
 

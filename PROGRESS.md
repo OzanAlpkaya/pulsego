@@ -1,7 +1,7 @@
 # PulseGo — Progress
 
 Last updated: 2026-11-11
-Current sprint: **Sprint 5 — Production Hardening** (not started; Sprint 4 done and merged)
+Current sprint: **Sprint 5 — Production Hardening** done, awaiting review/merge
 
 ---
 
@@ -126,7 +126,7 @@ Notes:
 
 ## Sprint 3 — Scheduler and Checker
 Status: **Done** (2026-11-11)
-Branch: `feature/sprint-03-scheduler-checker`
+Branch: `feature/sprint-03-scheduler-checker` — squash-merged into `main` as `d897497`
 
 Definition of Done:
 - [x] Concurrent `SKIP LOCKED` claims never double-assign a monitor
@@ -644,7 +644,7 @@ Notes:
 
 ## Sprint 4 — State and Incidents
 Status: **Done** (2026-11-11)
-Branch: `feature/sprint-04-state-incidents`
+Branch: `feature/sprint-04-state-incidents` — squash-merged into `main` as `e4586e4`
 
 Definition of Done:
 - [x] State transition table covered by unit tests for every edge
@@ -1099,19 +1099,530 @@ Notes:
 ---
 
 ## Sprint 5 — Production Hardening
-Status: **Not Started**
+Status: **Done** (2026-11-11)
 Branch: `feature/sprint-05-hardening`
 
 Definition of Done:
-- [ ] SSRF test suite covers loopback/private/link-local/redirect-to-private
+- [x] SSRF test suite covers loopback/private/link-local/redirect-to-private
       cases and all pass
-- [ ] All 10 Prometheus metrics exposed with bounded cardinality
-- [ ] Traces exported via OTLP; app starts fine with `OTEL_ENABLED=false`
-- [ ] `go test -race ./...` and the full CI pipeline are green
-- [ ] Docker image builds, runs as non-root, passes its health check
+      (`TestValidateURL`, `TestBlockedReason`,
+      `TestErrorsNeverLeakQueryOrUserinfo`, `TestDialerRejectsPrivateAnswer`,
+      `TestDialerRejectsBlockedLiteral`, `TestDialerRejectsMixedAnswers`,
+      `TestDialerDialsValidatedIP`, `TestControlCheck`,
+      `TestRedirectToPrivateIsBlocked`, `TestRedirectLimit`,
+      `TestCheckerBlocksLoopbackTarget`, `TestCheckRedirectToPrivateIsBlocked`,
+      `TestClassifyBlockedFirst`, `TestCreateMonitorRejectsPrivateTarget`,
+      `TestValidateURLAppliesSSRFPolicy`, `TestUpdateChecksPolicyOnlyForNewURL`,
+      `TestMigration00005BlockedErrorKind`)
+- [x] All 10 Prometheus metrics exposed with bounded cardinality
+      (`TestMetricsAllTenRegistered`, `TestMetricsCardinalityBounded`,
+      `TestMetricsLabelValues`, `TestNormalizeMethod`, `TestNormalizeRoute`,
+      `TestObserveRecordsRouteTemplates`, `TestInternalRouterServesMetrics`,
+      `TestPublicRouterDoesNotServeMetrics`,
+      `TestQueryTracerRecordsOperationNames`, plus the manual exposition
+      lists in the gate results below). Read as "all 10 across the
+      deployment, each emitted once observed": see D14 and `WAIVERS.md`.
+- [x] Traces exported via OTLP; app starts fine with `OTEL_ENABLED=false`
+      (`TestTracingExportsToOTLPReceiver`,
+      `TestTracingDisabledMakesNoRequests`,
+      `TestTracingUnreachableEndpointDoesNotBlock`,
+      `TestObserveStartsServerSpanWithPropagatedParent`,
+      `TestQueryTracerRecordsMetricAndSpan`, `TestSpansForOneCheck`,
+      `TestCheckSpanOnSuccess`, plus both binaries started with
+      `OTEL_ENABLED=false` in the gate below)
+- [x] `go test -race ./...` and the full CI pipeline are green
+      (`go test -race` green in the gate below; the CI pipeline part is
+      verified by the CI jobs `checks` and `integration` — **waiting for CI
+      after push**, see Notes)
+- [x] Docker image builds, runs as non-root, passes its health check
+      (verified by the CI job `docker` — **waiting for CI after push**, see
+      Notes; there is no Docker in the sandbox)
 
 Notes:
--
+- Plan approved 2026-11-11 (approval given in advance by the user for this
+  sprint; the user reviews these decisions before the squash-merge).
+  Implementation runs in agent-office, following the D11 commit order below.
+  The decisions below are binding and self-contained — an implementer should
+  not need the planning conversation. Anything not settled here is a question
+  for the user, not a guess (CLAUDE.md, "Ask, don't guess").
+- Decisions taken at sprint start (D1–D13 of the approved plan):
+  - **D1 — The SSRF policy lives in `internal/security`.** Stdlib only, and
+    no I/O except through the injected resolver.
+    - **Policy:** `type Policy struct{ AllowPrivate bool }`, built from
+      `ALLOW_PRIVATE_TARGETS`.
+    - **`Policy.ValidateURL(raw string) error`** is static: no DNS. Rules:
+      - The scheme is `http` or `https`, the URL parses, and the host is
+        not empty.
+      - No userinfo.
+      - The port is empty, 80 or 443 (any port 1–65535 when
+        `AllowPrivate`).
+      - IPv6 zone identifiers are rejected.
+      - When not `AllowPrivate`:
+        - A literal IP host must pass the address check.
+        - `localhost` and `*.localhost` are rejected.
+        - Non-canonical numeric hosts (`127.1`, `2130706433`,
+          `0x7f.0.0.1`, octal forms) are rejected as ambiguous.
+    - **`BlockedReason(netip.Addr) (reason string, blocked bool)`.** An
+      IPv4-mapped IPv6 address is unmapped first. Blocked ranges:
+      - Unspecified: `0.0.0.0`, `::`, and `0.0.0.0/8`.
+      - Loopback: `127.0.0.0/8`, `::1`.
+      - Private: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
+      - Shared/CGNAT: `100.64.0.0/10`.
+      - Link-local: `169.254.0.0/16` (including the `169.254.169.254`
+        metadata address), `fe80::/10`.
+      - Multicast: `224.0.0.0/4`, `ff00::/8`.
+      - Broadcast `255.255.255.255` and reserved `240.0.0.0/4`.
+      - IETF protocol assignments: `192.0.0.0/24`.
+      - Benchmarking: `198.18.0.0/15`.
+      - Documentation: `192.0.2.0/24`, `198.51.100.0/24`,
+        `203.0.113.0/24`, `2001:db8::/32`.
+      - IPv6 ULA `fc00::/7` and site-local `fec0::/10`.
+      - NAT64: `64:ff9b::/96` and `64:ff9b:1::/48`.
+      - 6to4 `2002::/16` and Teredo `2001::/32`.
+    - **`Dialer`** (`NewDialer(policy, opts...)`,
+      `DialContext(ctx, network, addr)`):
+      1. Splits `host:port` and checks the port.
+      2. Resolves the host **once** through an injectable resolver
+         (`LookupNetIP(ctx, network, host) ([]netip.Addr, error)`; the
+         default is `net.DefaultResolver`). Zero answers is a DNS error.
+      3. If **any** answer is blocked, the whole host is rejected (mixed
+         answers, DNS rebinding).
+      4. Dials the validated IP literals in order
+         (`net.JoinHostPort(ip.String(), port)`) — never the host name
+         again, so there is no TOCTOU re-resolution.
+      - Defense in depth: the inner `net.Dialer.Control` re-checks the
+        actual socket address.
+      - With `AllowPrivate`, the range check is skipped, but
+        resolve-then-dial-the-IP still applies.
+      - Options `WithResolver` and `WithDialFunc` let tests inject answers
+        and route connections to an httptest server.
+    - **`RedirectPolicy(policy, max int)`** returns an
+      `http.Client.CheckRedirect` func: at most `max` (5) redirects, and
+      every hop's URL passes `ValidateURL`. The dialer then checks the
+      resolved IPs of the hop.
+    - **Errors:** every rejection wraps the sentinel
+      `security.ErrBlockedTarget` (`errors.Is`). Messages carry the reason
+      and the host only — never the full URL, the query or userinfo.
+  - **D2 — SSRF wiring.**
+    - **New error kind `blocked`** (`domain.ErrorKindBlocked`):
+      - Migration `00005_error_kind_blocked.sql` recreates
+        `monitor_checks_error_kind_valid` with `'blocked'`. Its Down maps
+        `blocked` rows to `unknown`, then restores the old constraint.
+      - The `error_kind` enum in `api/openapi.yaml` gains `blocked`.
+      - `classify` maps `errors.Is(err, security.ErrBlockedTarget)` to
+        `blocked`, before any other rule.
+    - **Checker:** `checker.New(policy security.Policy, opts...)`. The
+      policy is a required argument, so an unprotected checker cannot be
+      built by accident.
+      - It installs the security dialer and
+        `RedirectPolicy(policy, MaxRedirects)`.
+      - It validates `m.URL` before the request: blocked, without dialing.
+      - Existing checker tests that hit httptest on `127.0.0.1` use
+        `Policy{AllowPrivate: true}`.
+    - **The persisted `error_message` never contains the URL.** Use the
+      inner error of `*url.Error`, so query strings cannot leak (Rule 10).
+    - **API:** monitor create and update run `Policy.ValidateURL` (static
+      only, no DNS: DNS in a handler is slow and a TOCTOU trap; the dialer
+      is the real guarantee). A rejection returns the existing 422
+      validation problem on field `url`.
+    - **Wiring:** `cmd/api` passes `ALLOW_PRIVATE_TARGETS` into the monitor
+      service; `cmd/worker` passes it into the checker.
+    - **README** gets an "SSRF protection" section, including the dev-only
+      risk of `ALLOW_PRIVATE_TARGETS=true`.
+  - **D3 — Prometheus metrics**, in `internal/telemetry/metrics.go`, on an
+    own `*prometheus.Registry` (plus the Go and process collectors) — never
+    the global one. Exactly these 10:
+    1. `pulsego_http_requests_total` — counter {method, route, code}.
+    2. `pulsego_http_request_duration_seconds` — histogram {method, route},
+       default buckets.
+    3. `pulsego_monitor_checks_total` — counter
+       {result=success|failure, error_kind=none|<kind>}.
+    4. `pulsego_monitor_check_duration_seconds` — histogram {result},
+       buckets 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30.
+    5. `pulsego_monitor_state_total` — counter {from, to}, incremented when
+       a recorded result changes the state (from ≠ to).
+    6. `pulsego_worker_claimed_monitors_total` — counter, no labels.
+    7. `pulsego_worker_active_checks` — gauge, no labels.
+    8. `pulsego_worker_claim_errors_total` — counter, no labels.
+    9. `pulsego_scheduler_lag_seconds` — histogram of claim time − the
+       claimed `next_check_at`, per monitor, clamped to ≥ 0; buckets 0.1,
+       0.5, 1, 2, 5, 10, 30, 60, 120, 300.
+    10. `pulsego_db_operation_duration_seconds` — histogram
+        {operation, outcome=ok|error}. `operation` is the sqlc query name,
+        parsed from the `-- name: X` prefix of the SQL; anything else is
+        `other`.
+    - **Cardinality rules:**
+      - `method` is normalised to GET, HEAD, POST, PUT, PATCH, DELETE or
+        OPTIONS, else `OTHER`.
+      - `route` is the chi route pattern, or `unmatched`.
+      - `code` is the 3-digit status.
+      - `error_kind` and the states are checked against the domain enums
+        (else `unknown`).
+      - Never URLs, monitor IDs, error messages or request IDs.
+    - Both binaries register all 10. `/metrics` is served only on
+      `INTERNAL_HTTP_ADDR`.
+  - **D4 — Tracing**, in `internal/telemetry/tracing.go`:
+    `SetupTracing(ctx, TracingConfig{Enabled, Endpoint, ServiceName, Environment}) (shutdown func(context.Context) error, err error)`.
+    - **Disabled:** noop provider, no-op shutdown, no network at all.
+    - **Enabled:**
+      - `otlptracehttp` (OTLP/HTTP protobuf, not gRPC — fewer
+        dependencies), with the endpoint as a full URL (e.g.
+        `http://otel-collector:4318`).
+      - Batch span processor; `ParentBased(AlwaysSample)`.
+      - Resource attributes `service.name` and `deployment.environment`.
+      - Global W3C TraceContext + Baggage propagator.
+      - Creating the exporter never dials. Export errors go to slog at warn
+        via `otel.SetErrorHandler`.
+      - Shutdown is bounded by `SHUTDOWN_TIMEOUT`; its error is logged,
+        never fatal.
+      - An unreachable collector must never block startup or requests.
+    - **Config:** when `OTEL_ENABLED=true`, `OTEL_EXPORTER_OTLP_ENDPOINT`
+      must be an http(s) URL with a host; otherwise it is a config error.
+    - **Spans.** No headers, no query strings, no bodies, no API key, no SQL
+      arguments.
+      - Incoming HTTP: a `"<METHOD> <route>"` server span
+        (`http.request.method`, `http.route`, `http.response.status_code`).
+      - DB: a `"db <operation>"` client span from the pgx tracer
+        (`db.system.name=postgresql`, `db.operation.name`; no statement
+        text or arguments).
+      - Worker claim cycle: `scheduler.claim` (the claimed count).
+      - Per check: a `scheduler.check` root span with the children:
+        - `checker.check`, a client span (`server.address` = host only,
+          `http.response.status_code`, `pulsego.error_kind`);
+        - `monitor.record`, with the events `incident.opened` /
+          `incident.resolved` and the `state.from` / `state.to`
+          attributes.
+  - **D5 — One pgx `QueryTracer`** in `internal/telemetry` produces both the
+    DB metric and the DB span. `repository.NewPool` takes it as an optional
+    argument (nil allowed).
+  - **D6 — HTTP surface.**
+    - **One `Observe` middleware** on the public router records metrics 1–2
+      and the server span. The route is read from chi after the handler
+      ran. The internal router is not instrumented (scrapes would be
+      noise).
+    - **`/readyz`** (GET and HEAD) on both the public and the internal
+      router:
+      - Pings PostgreSQL through a `Pinger` interface with a 2s timeout.
+      - 200 `{"status":"ready"}`; otherwise 503 problem+json with type
+        `urn:pulsego:problem:not-ready` and no error detail in the body
+        (the error is logged at warn).
+      - `/healthz` stays DB-free.
+      - The public `/readyz` goes into `api/openapi.yaml`.
+    - **`/metrics`** (GET) on the internal router only.
+      `NewInternalRouter` takes the pinger and the metrics handler.
+  - **D7 — Worker observability.**
+    - The worker gets an internal HTTP server on `INTERNAL_HTTP_ADDR`
+      (`/healthz`, `/readyz`, `/metrics`), with graceful shutdown.
+    - The scheduler takes a consumer-side `Metrics` interface and records
+      metrics 3–9 and the D4 worker spans.
+    - `make run-worker` sets `INTERNAL_HTTP_ADDR=:9091`, so it does not
+      collide with a local api.
+  - **D8 — Docker and Compose.**
+    - **Dockerfile:** multi-stage, runtime kept on `alpine:3.22`.
+      - The shell and busybox `wget` are kept for the health check and for
+        debugging. Distroless was considered and rejected, because it needs
+        a probe binary.
+      - `CGO_ENABLED=0`, `-trimpath`, ca-certificates. The GNU `wget`
+        package is dropped (busybox `wget` is enough).
+      - Numeric non-root `USER 10001:10001`.
+      - `HEALTHCHECK` does a GET on `http://127.0.0.1:9090/healthz`.
+      - `GO_VERSION=1.27` (`golang:1.27-alpine`): the latest Go 1.27
+        patch, independent of `go.mod`'s `go` directive (see D15).
+      - No migration at startup: the `migrate` image stays a one-shot job,
+        and its health check is disabled in Compose.
+    - **Compose:**
+      - The worker gets a health check.
+      - Profile `observability` adds otel-collector (OTLP/HTTP 4318 in,
+        Jaeger out), jaeger, prometheus (scrapes `api:9090` and
+        `worker:9090`) and grafana with a provisioned Prometheus
+        datasource.
+      - Files: `deployments/prometheus.yml`,
+        `deployments/otel-collector.yaml`,
+        `deployments/grafana-datasources.yaml`.
+      - Tracing stays off unless `OTEL_ENABLED=true`.
+    - `.dockerignore` also excludes `.env.*` (keeping `!.env.example`),
+      `*.test`, the root-level `/worker` and `/migrate` binaries (anchored,
+      so `cmd/worker` and `cmd/migrate` stay in the context), and
+      `.idea`/`.vscode`, so env files and local artefacts never reach the
+      build context (commit 027a7e0).
+  - **D9 — CI**, in `.github/workflows/ci.yml`. It runs on every `push` and
+    `pull_request`, with `permissions: contents: read`, and concurrency
+    cancels superseded runs.
+    - **Job `checks`:** `gofmt -l .` must be empty; `go mod tidy -diff`;
+      `go tool sqlc diff`; `go vet ./...` (plus `-tags integration`);
+      `go tool golangci-lint run` (plus `--build-tags integration`);
+      `go test -race ./...`; `go tool govulncheck ./...`; and the three
+      `go build -o bin/...` builds.
+    - **Job `integration`:** Testcontainers mode —
+      `go test -race -tags integration -count=1 -timeout 15m ./...` with
+      `PULSEGO_TEST_DATABASE_URL` unset.
+    - **Job `docker`:**
+      - `docker build` of the api, worker and migrate images.
+      - Then it runs postgres, the migrate image, and the api and worker
+        images on one network.
+      - It waits (bounded) until `docker inspect` reports both `healthy`,
+        asserts the container user is non-root (`id -u` ≠ 0), and checks
+        that `/readyz` returns 200.
+      - Logs are dumped on failure.
+    - **Actions:** only `actions/checkout` and `actions/setup-go`
+      (`go-version: '1.27.x'`, `check-latest: true`, with
+      `GOTOOLCHAIN: local` at workflow level; see D15), each pinned to a
+      full commit SHA with a `# vX.Y.Z` comment. golangci-lint and govulncheck run via `go tool`,
+      so there is no other third-party action.
+    - The Docker build, the container health check and Testcontainers mode
+      are verified only by GitHub Actions, after the user pushes (no Docker
+      in the sandbox).
+  - **D10 — No new environment variables.** New modules only:
+    - `github.com/prometheus/client_golang`;
+    - `go.opentelemetry.io/otel` (plus `sdk`, `trace` and
+      `exporters/otlp/otlptrace/otlptracehttp`);
+    - `go.opentelemetry.io/proto/otlp`, for the test receiver.
+    - No otelhttp/otelpgx contrib: our own middleware and tracer keep the
+      labels and attributes under our control.
+    - Only the telemetry sub-task adds modules.
+  - **D11 — Commit order.** One concern per commit. Each agent-office
+    sub-task commits on its own branch, and they are merged at QA:
+    1. `docs:` this plan plus the status update (this commit).
+    2. `feat:` `internal/security`, with the SSRF unit suite (D1).
+    3. `feat:` SSRF wiring: the blocked error kind, migration 00005, the
+       checker, API validation and the README section (D2).
+    4. `feat:` telemetry foundation: metrics, tracing, the pgx tracer and
+       the config endpoint check (D3–D5, D10).
+    5. `feat:` API observability: middleware, `/readyz`, `/metrics`, the
+       pool tracer and the api wiring (D6).
+    6. `feat:` worker observability: the internal server, scheduler metrics
+       and spans (D7).
+    7. `build:` Dockerfile, the Compose observability profile, the CI
+       workflow and the Makefile (D8, D9).
+    8. `docs:` README observability section, and close out Sprint 5 after
+       the gate (D13).
+  - **D12 — Test list.** The DoD item each test proves is in brackets.
+    - **Unit tests** (no tag):
+      - `TestValidateURL`: schemes, credentials, malformed URLs, ports,
+        localhost, ambiguous numeric hosts, and literal blocked IPs
+        including `::ffff:127.0.0.1` [SSRF].
+      - `TestBlockedReason`: one case per range, plus public addresses
+        allowed [SSRF].
+      - `TestDialerRejectsPrivateAnswer`, `TestDialerRejectsMixedAnswers`,
+        `TestDialerDialsValidatedIP` (with a rebinding resolver, the inner
+        dial receives exactly the validated IP) [SSRF].
+      - `TestRedirectToPrivateIsBlocked` and `TestRedirectLimit` (httptest
+        via the injected dial): a redirect to `127.0.0.1`, to
+        `169.254.169.254`, or to a name resolving to `10.x` gives
+        error_kind `blocked`, and the blocked hop is never dialled [SSRF].
+      - `TestCheckerBlocksLoopbackTarget` [SSRF].
+      - API: `TestCreateMonitorRejectsPrivateTarget` [SSRF].
+      - `TestMetricsAllTenRegistered` and `TestMetricsCardinalityBounded`
+        (thousands of distinct paths, IDs, methods and errors stay within a
+        fixed series count, and no label holds a UUID or URL) [metrics].
+      - `TestTracingExportsToOTLPReceiver` (an httptest OTLP/HTTP receiver
+        decodes the protobuf and sees spans with `service.name`),
+        `TestTracingDisabledMakesNoRequests` and
+        `TestTracingUnreachableEndpointDoesNotBlock` [traces].
+      - `TestReadyz` (200/503 with a fake pinger) and
+        `TestInternalRouterServesMetrics` [metrics].
+      - Scheduler metric tests with a fake `Metrics` [metrics].
+      - Config tests for the endpoint check.
+    - **Integration tests** (`-tags integration`):
+      - Migration 00005 up/down.
+      - `TestReadyzWithDatabase`.
+      - The pgx tracer records operation names against real PostgreSQL.
+      - The existing suite already covers the ROADMAP list (migrations,
+        CRUD, claims, SKIP LOCKED, lease reclaim, the record transaction,
+        incident uniqueness, pagination, soft delete, stats). The close-out
+        sub-task audits it and fills gaps.
+  - **D13 — Gate before reporting done.**
+    - Run the full `/sprint-done` gate: `gofmt -l`, `go vet` (also with
+      `-tags integration`), `go tool golangci-lint run` (also with
+      `--build-tags integration`), `go test -race ./...`,
+      `go tool govulncheck ./...`, and the three `-o bin/` builds.
+    - **Plus** the integration suite, with `PULSEGO_TEST_DATABASE_URL` set
+      after `pg-test-up`.
+    - **Plus** starting both binaries with `OTEL_ENABLED=false` against the
+      sandbox PostgreSQL, and probing `/healthz`, `/readyz` and `/metrics`.
+    - The Docker build, the container health check and Testcontainers mode
+      are reported as **waiting for CI**.
+    - Record the real output under these Notes.
+    - **Do not merge or push** (Rule 2).
+- **D14 — Metric exposition** (decided by the tech lead on 2026-11-11, during
+  the D13 gate).
+  - The D13 step "the 10 metric names appear on `/metrics` of both
+    binaries" was too strict, and it failed as written:
+    - a fresh api showed 9/10;
+    - the worker always shows 8/10.
+  - Why:
+    - **HTTP metrics 1–2 are api-only.** Only the public router is
+      instrumented (D6), and the worker has no public router.
+    - **Label-vector series appear on first observation.** That is
+      standard Prometheus behaviour; an empty vector is not written out.
+    - **The `/readyz` ping is not a traced query.** So
+      `pulsego_db_operation_duration_seconds` appears only after the first
+      real query.
+  - Fake pre-initialised series (e.g. HTTP routes on the worker) were
+    rejected as misleading.
+  - The revised step:
+    - api `/metrics` shows all 10 names after one real `/v1` request;
+    - worker `/metrics` shows its 8 (metrics 3–10) after one claim cycle.
+  - Waiver recorded in `WAIVERS.md`.
+- **D15 — Build toolchain vs. go directive.**
+  - `go.mod`'s `go 1.26.5` stays as the minimum language/version
+    requirement. No `toolchain` line.
+  - CI (`actions/setup-go` with `go-version: '1.27.x'`, `check-latest: true`,
+    and `GOTOOLCHAIN: local` so the go command never switches toolchains)
+    and the Docker build (`golang:1.27-alpine`, `ARG GO_VERSION=1.27`) use
+    the latest Go 1.27 patch, so the standard library carries every
+    security fix.
+  - Reason: CI `govulncheck` failed with ~20 standard-library
+    vulnerabilities in go1.26.5, which setup-go had taken from `go.mod`.
+    The sandbox (go1.27.4) never showed them.
+  - `golang.org/x/net` bumped from v0.61.0 to v0.62.0 (indirect) for
+    GO-2026-6866 and GO-2026-6860. `go mod tidy` changed nothing else.
+  - Gate result (2026-11-11, Go go1.27.4, `GOTOOLCHAIN=local`): `gofmt -l`
+    empty; `go vet` (± `-tags integration`) rc=0; `golangci-lint` (±
+    `--build-tags integration`) `0 issues.`; `go test -race ./...` rc=0;
+    `go tool govulncheck ./...` (v1.7.0, DB updated 2026-11-11)
+    `No vulnerabilities found.` with no uncalled module findings; the three
+    `go build -o bin/...` rc=0; `go mod tidy -diff` and `go tool sqlc diff`
+    no diff; integration suite (`PULSEGO_TEST_DATABASE_URL` mode) every
+    package `ok`, 0 leftover test databases; `ci.yml` parses with
+    yaml.v3. The CI run on go1.27.x itself is **waiting for CI after
+    push**.
+- Resolved during implementation:
+  - **PATCH skips the SSRF policy check when the request does not set
+    `url`** (`a74a34f`, `TestUpdateChecksPolicyOnlyForNewURL`). A monitor
+    stored before Sprint 5 with a now-disallowed URL can still be renamed
+    or disabled. The syntax checks still run, and the dialer still blocks
+    the target at check time (`error_kind` `blocked`).
+  - **Unauthenticated `/v1` requests are labelled `route="/v1/*"`.** The
+    API key middleware rejects them before chi matches the inner route
+    (`TestObserveRecordsRouteTemplates`).
+  - **Trace service names are `<SERVICE_NAME>-api` and
+    `<SERVICE_NAME>-worker`**, by default `pulsego-api` and
+    `pulsego-worker`, the same as the log `service` attribute.
+  - **Prometheus is on host port 9092** in the `observability` profile
+    (`PROMETHEUS_PORT`). Host 9090 is the api's internal port and 9091 is
+    `make run-worker`.
+- **Resolved: the Sprint 3/4 risk "no SSRF protection until Sprint 5".**
+  - Every outbound check goes through `internal/security`: the policy, the
+    validating dialer and the redirect policy (D1, D2).
+  - Monitor create and update validate `url` against the policy.
+  - `ALLOW_PRIVATE_TARGETS=true` is refused outside
+    `ENVIRONMENT=development`.
+- **Integration-suite audit** (D12, against the ROADMAP Sprint 5 list). No
+  gap was found, so no test was added. The tests are in
+  `internal/repository/*_integration_test.go`:
+  - Migrations: `TestMigrationsUpDown`,
+    `TestMigration00005BlockedErrorKind`, `TestMonitorsPartialIndex`,
+    `TestMonitorsConstraints`, `TestMonitorChecksConstraints`,
+    `TestIncidentsConstraints`, `TestIncidentsForeignKeys`.
+  - CRUD: `TestCreateAndGet`, `TestGetMissingReturnsNotFound`,
+    `TestConstraintViolationBecomesValidationError`, `TestUpdatePartial`,
+    `TestUpdateShorteningIntervalPullsNextCheckForward`,
+    `TestUpdateDoesNotPushNextCheckOut`, `TestUpdateMissingReturnsNotFound`,
+    `TestListOrdersNewestFirst`, `TestListEmptyReturnsEmptySlice`.
+  - Worker claims: `TestClaimIgnoresActiveLease`,
+    `TestClaimSkipsDisabledDeletedAndNotDue`, `TestClaimRespectsBatchSize`,
+    `TestClaimLeaseCoversMonitorTimeout`, `TestReleaseLease`,
+    `TestRequestCheck`, `TestSchedulerEndToEnd`.
+  - Concurrent `SKIP LOCKED`: `TestClaimParallelClaimersNeverDoubleAssign`,
+    `TestClaimSkipsRowsLockedByOpenTransaction`.
+  - Lease expiration/reclaim: `TestExpiredLeaseReclaimedByDifferentWorker`,
+    `TestRecordOnDeletedMonitorLosesLease`.
+  - Check-result transaction: `TestRecordCheckResult`,
+    `TestRecordPreservesManualRequestDuringCheck`,
+    `TestRecordLifecycleOpensAndResolvesIncident`,
+    `TestRecordReadsStateUnderRowLock`,
+    `TestRecordRollsBackOnIncidentFailure`,
+    `TestRecordWithIncidentAlreadyOpen`,
+    `TestRecordConcurrentResultsForOneMonitor`.
+  - Incident uniqueness: `TestIncidentsOneUnresolvedPerMonitor`,
+    `TestIncidentsConcurrentUnresolvedInsert`.
+  - Cursor pagination: `TestListKeysetPagination`,
+    `TestListChecksKeysetPagination`, `TestListIncidentsKeysetPagination`
+    (plus the `…EmptyReturnsEmptySlice` variants).
+  - Soft delete: `TestSoftDelete`, `TestSoftDeleteClearsLease`
+    (claims and records skip deleted monitors, see above).
+  - Stats: `TestMonitorStatsWindows`, `TestMonitorStatsEndpoint`.
+  - Also covered (Sprint 5 additions and retention):
+    `TestReadyzWithDatabase`, `TestNewPoolInstallsQueryTracer`,
+    `TestQueryTracerRecordsOperationNames`, `TestDeleteExpiredChecks`,
+    `TestQAConcurrentRetentionCleanersDeleteEachRowOnce`.
+- **Base check before the gate.** The close-out base lacked `a74a34f` (the
+  monitor PATCH fix). Per the tech lead, it was merged with
+  `git merge --no-ff a74a34f` (merge commit `c01fc7b`; it touches
+  `internal/monitor` only). Every other Sprint 5 commit was already in the
+  base: `87d1604`, `1c9d131`, `be80a6b`, `ba11427`, `6042b61`, `a2bce16` and
+  `027a7e0`. `make run-worker` still sets `INTERNAL_HTTP_ADDR=:9091`. The
+  full gate was re-run after the merge; the results below are from that run.
+- **Gate results (2026-11-11)**, D13, run on `c01fc7b` plus the README
+  changes (Go 1.27.4 in the agent-office sandbox, `GOTOOLCHAIN=local`):
+  - `gofmt -l .` → empty.
+  - `go vet ./...` → rc=0 (also rc=0 with `-tags integration`).
+  - `go tool golangci-lint run` (v2.15.0) → `0 issues.` (also `0 issues.`
+    with `--build-tags integration`).
+  - `go test -race -count=1 ./...` → `ok` for checker, config, domain,
+    httpapi, monitor, scheduler, security and telemetry; rc=0.
+  - `go tool govulncheck ./...` (v1.7.0, DB updated 2026-11-11) →
+    `No vulnerabilities found.`, rc=0. At the time it also reported 2
+    vulnerabilities in `golang.org/x/net` v0.61.0 that the code does not
+    call; they are gone since the D15 bump to v0.62.0. No waiver needed.
+  - `go build -o bin/api ./cmd/api`, `go build -o bin/worker ./cmd/worker`,
+    `go build -o bin/migrate ./cmd/migrate` → all rc=0.
+  - `go mod tidy` → no diff in `go.mod`/`go.sum`. `go tool sqlc diff` →
+    rc=0, no diff.
+  - **Integration suite, `PULSEGO_TEST_DATABASE_URL` mode** (local
+    PostgreSQL 17 via `pg-test-up`),
+    `go test -race -tags integration -count=1 -timeout 15m ./...`:
+    - every package `ok`, rc=0 (repository 2.165s, scheduler 1.866s);
+    - no race-runtime linker flake, so `-p 1` was not needed;
+    - leftover `pulsego_test_*` databases: **0**.
+  - **Binary smoke test.** Setup:
+    - a scratch database `pulsego_smoke` on the sandbox server;
+    - `bin/migrate up` → `successfully migrated database to version: 5`;
+    - `bin/api` on `127.0.0.1:18080` / internal `127.0.0.1:19090`;
+    - `bin/worker` on internal `127.0.0.1:19091`;
+    - both with `OTEL_ENABLED=false`.
+  - Smoke-test results:
+    - `/healthz` → 200 `{"status":"ok"}` and `/readyz` → 200
+      `{"status":"ready"}` on the api public port, the api internal port
+      and the worker internal port.
+    - `/metrics` → 200 on both internal ports, 404 on the api public port.
+    - api `/metrics`, after one `GET /v1/monitors` (200): all 10 —
+      `pulsego_db_operation_duration_seconds`,
+      `pulsego_http_request_duration_seconds`,
+      `pulsego_http_requests_total`,
+      `pulsego_monitor_check_duration_seconds`,
+      `pulsego_monitor_checks_total`, `pulsego_monitor_state_total`,
+      `pulsego_scheduler_lag_seconds`, `pulsego_worker_active_checks`,
+      `pulsego_worker_claim_errors_total`,
+      `pulsego_worker_claimed_monitors_total`.
+    - worker `/metrics`, after at least one claim cycle (7s at a 5s poll
+      interval): the 8 expected (metrics 3–10) —
+      `pulsego_db_operation_duration_seconds`,
+      `pulsego_monitor_check_duration_seconds`,
+      `pulsego_monitor_checks_total`, `pulsego_monitor_state_total`,
+      `pulsego_scheduler_lag_seconds`, `pulsego_worker_active_checks`,
+      `pulsego_worker_claim_errors_total`,
+      `pulsego_worker_claimed_monitors_total`. The HTTP metrics 1–2 are
+      absent, as D14 expects.
+    - SIGTERM to both → api `shutting down` … `server stopped` (public,
+      internal) … `stopped`, exit 0; worker `scheduler stopping`
+      (`in_flight` 0) … `scheduler stopped` … `server stopped` (internal)
+      … `stopped`, exit 0.
+  - **Waiting for CI after push** (no Docker in the sandbox), via
+    `.github/workflows/ci.yml`:
+    - job `checks`: the full CI pipeline part of DoD item 4;
+    - job `integration`: the integration suite in Testcontainers mode;
+    - job `docker`: the image builds, the non-root user, the health
+      checks and `/readyz` (DoD item 5).
+  - README updated:
+    - a new Observability section: health vs readiness, the 10 metrics
+      and their labels, cardinality rules, exposition behaviour, tracing,
+      and the Compose `observability` profile with its URLs;
+    - a new CI section;
+    - the SSRF section now notes the PATCH rule;
+    - the status line says Sprint 5 is complete, and the "no SSRF
+      protection" warning is gone.
 
 ---
 

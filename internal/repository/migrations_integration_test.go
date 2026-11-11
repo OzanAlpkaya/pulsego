@@ -94,6 +94,12 @@ func TestMigrationsUpDown(t *testing.T) {
 
 	migrateUp(t, sqlDB)
 
+	if got, err := goose.GetDBVersionContext(context.Background(), sqlDB); err != nil {
+		t.Fatalf("goose version: %v", err)
+	} else if got != latestMigration {
+		t.Errorf("schema version after up = %d, want %d", got, latestMigration)
+	}
+
 	for _, table := range migratedTables {
 		if !tableExists(t, sqlDB, table) {
 			t.Errorf("%s table does not exist after migrating up", table)
@@ -110,6 +116,71 @@ func TestMigrationsUpDown(t *testing.T) {
 		if tableExists(t, sqlDB, table) {
 			t.Errorf("%s table still exists after migrating down", table)
 		}
+	}
+}
+
+// latestMigration is the version of the newest file in db/migrations. Bump it
+// with every new migration so this test notices a file that goose skipped.
+const latestMigration = 5
+
+// TestMigration00005BlockedErrorKind proves the 'blocked' error kind exists
+// only from migration 00005 on, and that rolling it back keeps the affected
+// check rows (as 'unknown') instead of failing on the restored constraint.
+func TestMigration00005BlockedErrorKind(t *testing.T) {
+	url := startPostgres(t)
+	sqlDB := openSQL(t, url)
+	ctx := context.Background()
+
+	goose.SetBaseFS(db.Migrations)
+	if err := goose.SetDialect("postgres"); err != nil {
+		t.Fatalf("set goose dialect: %v", err)
+	}
+	if err := goose.UpToContext(ctx, sqlDB, db.MigrationsDir, 4); err != nil {
+		t.Fatalf("goose up to 4: %v", err)
+	}
+
+	var monitorID string
+	if err := sqlDB.QueryRowContext(ctx, `
+		INSERT INTO monitors (name, url, interval_seconds, timeout_ms,
+		                      expected_status_min, expected_status_max, failure_threshold)
+		VALUES ('example', 'https://example.com', 60, 5000, 200, 399, 3)
+		RETURNING id`).Scan(&monitorID); err != nil {
+		t.Fatalf("insert monitor: %v", err)
+	}
+
+	insertBlocked := func() (int64, error) {
+		var id int64
+		err := sqlDB.QueryRowContext(ctx, `
+			INSERT INTO monitor_checks (monitor_id, success, latency_ms, error_kind, error_message)
+			VALUES ($1, false, 0, 'blocked', 'blocked target: loopback')
+			RETURNING id`, monitorID).Scan(&id)
+		return id, err
+	}
+
+	if _, err := insertBlocked(); err == nil || !strings.Contains(err.Error(), "monitor_checks_error_kind_valid") {
+		t.Fatalf("insert 'blocked' before 00005: err = %v, want a monitor_checks_error_kind_valid violation", err)
+	}
+
+	if err := goose.UpToContext(ctx, sqlDB, db.MigrationsDir, 5); err != nil {
+		t.Fatalf("goose up to 5: %v", err)
+	}
+	checkID, err := insertBlocked()
+	if err != nil {
+		t.Fatalf("insert 'blocked' after 00005: %v", err)
+	}
+
+	if err := goose.DownToContext(ctx, sqlDB, db.MigrationsDir, 4); err != nil {
+		t.Fatalf("goose down to 4: %v", err)
+	}
+	var kind string
+	if err := sqlDB.QueryRowContext(ctx, `SELECT error_kind FROM monitor_checks WHERE id = $1`, checkID).Scan(&kind); err != nil {
+		t.Fatalf("read check after down: %v", err)
+	}
+	if kind != "unknown" {
+		t.Errorf("error_kind after down = %q, want unknown", kind)
+	}
+	if _, err := insertBlocked(); err == nil || !strings.Contains(err.Error(), "monitor_checks_error_kind_valid") {
+		t.Fatalf("insert 'blocked' after down: err = %v, want a monitor_checks_error_kind_valid violation", err)
 	}
 }
 
@@ -238,7 +309,7 @@ func TestNewPoolConnects(t *testing.T) {
 	url := startPostgres(t)
 
 	ctx := context.Background()
-	pool, err := repository.NewPool(ctx, url, 5)
+	pool, err := repository.NewPool(ctx, url, 5, nil)
 	if err != nil {
 		t.Fatalf("NewPool() returned an unexpected error: %v", err)
 	}
@@ -255,7 +326,7 @@ func TestNewPoolRejectsUnreachableDatabase(t *testing.T) {
 	ctx := context.Background()
 
 	// Port 1 is reserved and never listening.
-	_, err := repository.NewPool(ctx, "postgres://pulsego:pulsego@127.0.0.1:1/pulsego?sslmode=disable", 5)
+	_, err := repository.NewPool(ctx, "postgres://pulsego:pulsego@127.0.0.1:1/pulsego?sslmode=disable", 5, nil)
 	if err == nil {
 		t.Fatal("NewPool() succeeded against an unreachable database, want an error")
 	}

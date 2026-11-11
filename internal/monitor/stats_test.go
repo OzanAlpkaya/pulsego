@@ -10,6 +10,7 @@ import (
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/monitor"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 func TestStats(t *testing.T) {
@@ -26,7 +27,7 @@ func TestStats(t *testing.T) {
 		store.rawStats = domain.RawStats{
 			TotalChecks: 4, SuccessfulChecks: 3, AvgLatencyMs: &avg, P95LatencyMs: &p95, WindowEnd: end,
 		}
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, err := svc.Stats(context.Background(), id, domain.StatsWindow30d)
 		if err != nil {
@@ -50,7 +51,7 @@ func TestStats(t *testing.T) {
 		t.Parallel()
 
 		store := newFakeStore()
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		_, err := svc.Stats(context.Background(), uuid.New(), domain.StatsWindow24h)
 		if !errors.Is(err, domain.ErrNotFound) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,7 +24,11 @@ const (
 
 // NewPool opens a connection pool and verifies it can reach the database.
 // Callers own the returned pool and must Close it during shutdown.
-func NewPool(ctx context.Context, databaseURL string, maxConns int32) (*pgxpool.Pool, error) {
+//
+// tracer, when not nil, observes every query on every connection; the
+// binaries pass telemetry.NewQueryTracer so one tracer produces both the DB
+// metric and the DB span (D5).
+func NewPool(ctx context.Context, databaseURL string, maxConns int32, tracer pgx.QueryTracer) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
@@ -35,6 +40,9 @@ func NewPool(ctx context.Context, databaseURL string, maxConns int32) (*pgxpool.
 	poolCfg.MaxConnIdleTime = maxConnIdleTime
 	poolCfg.HealthCheckPeriod = healthCheckPeriod
 	poolCfg.ConnConfig.ConnectTimeout = connectTimeout
+	if tracer != nil {
+		poolCfg.ConnConfig.Tracer = tracer
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {

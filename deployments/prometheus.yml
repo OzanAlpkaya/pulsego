@@ -1,0 +1,17 @@
+# Prometheus for the Compose `observability` profile. Both binaries serve
+# /metrics on their internal listener (INTERNAL_HTTP_ADDR, :9090), which is
+# reachable inside the Compose network only.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: pulsego-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:9090"]
+
+  - job_name: pulsego-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9090"]

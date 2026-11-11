@@ -10,12 +10,17 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
+
+// allowLoopback is the development policy. The tests below that hit an
+// httptest server on 127.0.0.1 need it; the strict policy is covered by
+// ssrf_test.go.
+var allowLoopback = security.Policy{AllowPrivate: true}
 
 func testMonitor(url string) domain.Monitor {
 	return domain.Monitor{
@@ -64,7 +69,7 @@ func TestCheckSuccess(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	out := mustCheck(t, New(), testMonitor(srv.URL))
+	out := mustCheck(t, New(allowLoopback), testMonitor(srv.URL))
 	if !out.Success {
 		t.Fatalf("Success = false, want true (kind %v)", out.ErrorKind)
 	}
@@ -87,7 +92,7 @@ func TestCheckUnexpectedStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	out := mustCheck(t, New(), testMonitor(srv.URL))
+	out := mustCheck(t, New(allowLoopback), testMonitor(srv.URL))
 	assertFailure(t, out, domain.ErrorKindUnexpectedStatus)
 	if out.StatusCode == nil || *out.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("StatusCode = %v, want 503", out.StatusCode)
@@ -113,7 +118,7 @@ func TestCheckTimeout(t *testing.T) {
 	m.TimeoutMS = 200
 
 	start := time.Now()
-	out := mustCheck(t, New(), m)
+	out := mustCheck(t, New(allowLoopback), m)
 	elapsed := time.Since(start)
 
 	assertFailure(t, out, domain.ErrorKindTimeout)
@@ -141,7 +146,7 @@ func TestCheckConnectionRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := mustCheck(t, New(), testMonitor("http://"+addr+"/"))
+	out := mustCheck(t, New(allowLoopback), testMonitor("http://"+addr+"/"))
 	assertFailure(t, out, domain.ErrorKindConnection)
 }
 
@@ -155,7 +160,7 @@ func TestCheckUntrustedTLS(t *testing.T) {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
-	out := mustCheck(t, New(), testMonitor(srv.URL))
+	out := mustCheck(t, New(allowLoopback), testMonitor(srv.URL))
 	assertFailure(t, out, domain.ErrorKindTLS)
 }
 
@@ -182,7 +187,7 @@ func TestCheckRedirectLoop(t *testing.T) {
 	t.Parallel()
 
 	srv := redirectServer(t)
-	out := mustCheck(t, New(), testMonitor(srv.URL+"/loop?token=secret"))
+	out := mustCheck(t, New(allowLoopback), testMonitor(srv.URL+"/loop?token=secret"))
 	assertFailure(t, out, domain.ErrorKindRedirect)
 	if strings.Contains(*out.ErrorMessage, "secret") || strings.Contains(*out.ErrorMessage, srv.URL) {
 		t.Fatalf("ErrorMessage %q contains the URL", *out.ErrorMessage)
@@ -193,7 +198,7 @@ func TestCheckRedirectLimit(t *testing.T) {
 	t.Parallel()
 
 	srv := redirectServer(t)
-	c := New()
+	c := New(allowLoopback)
 
 	out := mustCheck(t, c, testMonitor(srv.URL+"/"+strconv.Itoa(MaxRedirects)))
 	if !out.Success {
@@ -215,7 +220,7 @@ func TestCheckSendsUserAgentAndGET(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	mustCheck(t, New(), testMonitor(srv.URL))
+	mustCheck(t, New(allowLoopback), testMonitor(srv.URL))
 	s := <-got
 	if s.method != http.MethodGet {
 		t.Errorf("method = %q, want GET", s.method)
@@ -252,7 +257,7 @@ func TestCheckBodyNotRetained(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New()
+	c := New(allowLoopback)
 
 	out := mustCheck(t, c, testMonitor(srv.URL+"/small"))
 	assertFailure(t, out, domain.ErrorKindUnexpectedStatus)
@@ -290,7 +295,7 @@ func TestCheckParentCancelled(t *testing.T) {
 	time.AfterFunc(50*time.Millisecond, cancel)
 
 	start := time.Now()
-	out, err := New().Check(ctx, testMonitor(srv.URL))
+	out, err := New(allowLoopback).Check(ctx, testMonitor(srv.URL))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Check() error = %v, want context.Canceled", err)
 	}
@@ -302,13 +307,13 @@ func TestCheckParentCancelled(t *testing.T) {
 	}
 
 	// An already-cancelled context never sends a request.
-	out, err = New().Check(ctx, testMonitor("http://invalid.invalid/"))
+	out, err = New(allowLoopback).Check(ctx, testMonitor("http://invalid.invalid/"))
 	if !errors.Is(err, context.Canceled) || out != (domain.CheckOutcome{}) {
 		t.Fatalf("Check(cancelled) = %+v, %v; want zero outcome and context.Canceled", out, err)
 	}
 }
 
-func TestCheckUsesDialHook(t *testing.T) {
+func TestCheckUsesDialerOptions(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -316,33 +321,30 @@ func TestCheckUsesDialHook(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	var calls atomic.Int32
-	var d net.Dialer
-	c := New(WithDialContext(func(ctx context.Context, network, addr string) (net.Conn, error) {
-		calls.Add(1)
-		return d.DialContext(ctx, network, addr)
-	}))
+	// A public name resolved by the test resolver, routed to the httptest
+	// server by the inner dial: the strict policy applies end to end.
+	rec := &recordingDial{target: srv.Listener.Addr().String()}
+	c := New(security.Policy{}, WithDialerOptions(
+		security.WithResolver(fakeResolver{"public.example": {publicIP}}),
+		security.WithDialFunc(rec.dial),
+	))
 
-	out := mustCheck(t, c, testMonitor(srv.URL))
+	out := mustCheck(t, c, testMonitor("http://public.example/"))
 	if !out.Success {
-		t.Fatalf("Success = false, want true")
+		t.Fatalf("Success = false, want true (kind %v, message %v)", out.ErrorKind, out.ErrorMessage)
 	}
-	if calls.Load() == 0 {
-		t.Fatal("custom dialer was not used")
+	if got := rec.addrs(); len(got) == 0 || got[0] != publicIP+":80" {
+		t.Fatalf("dialled %v, want the validated IP %s:80", got, publicIP)
 	}
-
-	refused := New(WithDialContext(func(context.Context, string, string) (net.Conn, error) {
-		return nil, errors.New("blocked by policy")
-	}))
-	out = mustCheck(t, refused, testMonitor(srv.URL))
-	assertFailure(t, out, domain.ErrorKindUnknown)
 }
 
+// TestCheckInvalidURL: an unparseable URL is refused by the policy's static
+// validation before a request is built, under either policy, so it is blocked.
 func TestCheckInvalidURL(t *testing.T) {
 	t.Parallel()
 
-	out := mustCheck(t, New(), testMonitor("http://exa mple.com/?token=secret"))
-	assertFailure(t, out, domain.ErrorKindUnknown)
+	out := mustCheck(t, New(allowLoopback), testMonitor("http://exa mple.com/?token=secret"))
+	assertFailure(t, out, domain.ErrorKindBlocked)
 	if strings.Contains(*out.ErrorMessage, "secret") {
 		t.Fatalf("ErrorMessage %q contains the URL", *out.ErrorMessage)
 	}
@@ -351,7 +353,7 @@ func TestCheckInvalidURL(t *testing.T) {
 func TestTransportSettings(t *testing.T) {
 	t.Parallel()
 
-	c := New()
+	c := New(allowLoopback)
 	tr := c.transport
 	if tr.Proxy != nil {
 		t.Error("Proxy is set, want nil")

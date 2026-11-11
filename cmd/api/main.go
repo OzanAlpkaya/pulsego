@@ -19,6 +19,7 @@ import (
 	"github.com/OzanAlpkaya/pulsego/internal/httpapi"
 	"github.com/OzanAlpkaya/pulsego/internal/monitor"
 	"github.com/OzanAlpkaya/pulsego/internal/repository"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 	"github.com/OzanAlpkaya/pulsego/internal/telemetry"
 )
 
@@ -53,7 +54,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := repository.NewPool(ctx, cfg.DB.URL, cfg.DB.MaxConns)
+	metrics := telemetry.NewMetrics()
+
+	// Tracing never dials during setup, so an unreachable collector cannot
+	// delay startup; with OTEL_ENABLED=false it installs a no-op provider.
+	shutdownTracing, err := telemetry.SetupTracing(ctx, telemetry.TracingConfig{
+		Enabled:     cfg.Telemetry.OTelEnabled,
+		Endpoint:    cfg.Telemetry.OTLPEndpoint,
+		ServiceName: cfg.ServiceName + "-api",
+		Environment: cfg.Environment,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("set up tracing: %w", err)
+	}
+	// Deferred before the pool, so it runs after the HTTP servers have
+	// drained and the pool is closed: the last spans are flushed too.
+	defer flushTracing(log, shutdownTracing, cfg.ShutdownTimeout)
+
+	pool, err := repository.NewPool(ctx, cfg.DB.URL, cfg.DB.MaxConns, telemetry.NewQueryTracer(metrics))
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
@@ -66,13 +84,19 @@ func run() error {
 		return fmt.Errorf("monitor defaults: %w", err)
 	}
 
-	monitors := monitor.NewService(repository.NewMonitorStore(pool), defaults)
+	monitors := monitor.NewService(repository.NewMonitorStore(pool), defaults,
+		security.Policy{AllowPrivate: cfg.Checks.AllowPrivateTargets})
 
 	public := newServer(cfg.Server.Addr, httpapi.NewRouter(httpapi.RouterConfig{
 		APIKey:   cfg.Server.APIKey,
 		Monitors: monitors,
+		Pinger:   pool,
+		Metrics:  metrics,
 	}, log))
-	internal := newServer(cfg.Server.InternalAddr, httpapi.NewInternalRouter())
+	internal := newServer(cfg.Server.InternalAddr, httpapi.NewInternalRouter(httpapi.InternalConfig{
+		Pinger:  pool,
+		Metrics: metrics.Handler(),
+	}, log))
 
 	// The group returns as soon as a listener fails or a signal arrives, at
 	// which point both servers are drained with the same deadline.
@@ -100,6 +124,18 @@ func run() error {
 
 	log.Info("stopped")
 	return nil
+}
+
+// flushTracing exports pending spans within SHUTDOWN_TIMEOUT. A failure is
+// logged, never returned: losing the last spans must not turn a clean stop
+// into a failed one.
+func flushTracing(log *slog.Logger, shutdown func(context.Context) error, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := shutdown(ctx); err != nil {
+		log.Warn("tracing shutdown failed", slog.Any("error", err))
+	}
 }
 
 func newServer(addr string, handler http.Handler) *http.Server {

@@ -1,0 +1,211 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Use the toolchain installed by setup-go as is. Without this, the go command
+# could switch to the toolchain named in go.mod (`go` or `toolchain` line)
+# and silently build and scan with an older standard library.
+env:
+  GOTOOLCHAIN: local
+
+# A newer push to the same ref supersedes the running pipeline.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Latest Go 1.27 patch, not go.mod's `go` directive: that directive
+          # is only the minimum version, and older patches miss stdlib
+          # security fixes that govulncheck reports.
+          go-version: '1.27.x'
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy
+        run: go mod tidy -diff
+
+      - name: sqlc generated code is up to date
+        run: go tool sqlc diff
+
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+
+      - name: golangci-lint
+        run: |
+          go tool golangci-lint run
+          go tool golangci-lint run --build-tags integration
+
+      - name: Unit tests
+        run: go test -race ./...
+
+      - name: govulncheck
+        run: go tool govulncheck ./...
+
+      - name: Build binaries
+        run: |
+          go build -o bin/api ./cmd/api
+          go build -o bin/worker ./cmd/worker
+          go build -o bin/migrate ./cmd/migrate
+
+  integration:
+    name: Integration tests (Testcontainers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Latest Go 1.27 patch, not go.mod's `go` directive: that directive
+          # is only the minimum version, and older patches miss stdlib
+          # security fixes that govulncheck reports.
+          go-version: '1.27.x'
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      # PULSEGO_TEST_DATABASE_URL stays unset, so the suite starts its own
+      # PostgreSQL containers through the runner's Docker daemon.
+      - name: Integration tests
+        run: |
+          unset PULSEGO_TEST_DATABASE_URL
+          go test -race -tags integration -count=1 -timeout 15m ./...
+
+  docker:
+    name: Docker images and health checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NETWORK: pulsego-ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build images
+        run: |
+          for binary in api worker migrate; do
+            docker build --build-arg BINARY="$binary" -t "pulsego-$binary:ci" -f deployments/Dockerfile .
+          done
+
+      - name: Start PostgreSQL
+        run: |
+          docker network create "$NETWORK"
+          docker run -d --name postgres --network "$NETWORK" \
+            -e POSTGRES_USER=pulsego \
+            -e POSTGRES_PASSWORD=pulsego \
+            -e POSTGRES_DB=pulsego \
+            --health-cmd "pg_isready -U pulsego -d pulsego" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            postgres:17-alpine
+          deadline=$((SECONDS + 120))
+          until [ "$(docker inspect -f '{{.State.Health.Status}}' postgres)" = healthy ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "postgres did not become healthy within 120s"
+              exit 1
+            fi
+            sleep 2
+          done
+
+      # Same settings as deployments/compose.yaml. The API key is a throwaway
+      # value for this job only.
+      - name: Write container environment
+        run: |
+          cat > "$RUNNER_TEMP/app.env" <<'ENV'
+          SERVICE_NAME=pulsego
+          ENVIRONMENT=development
+          LOG_LEVEL=info
+          DATABASE_URL=postgres://pulsego:pulsego@postgres:5432/pulsego?sslmode=disable
+          API_KEY=ci-only-throwaway-api-key
+          HTTP_ADDR=:8080
+          INTERNAL_HTTP_ADDR=:9090
+          OTEL_ENABLED=false
+          ENV
+
+      - name: Run migrations
+        run: |
+          docker run --rm --name migrate --network "$NETWORK" --no-healthcheck \
+            --env-file "$RUNNER_TEMP/app.env" \
+            pulsego-migrate:ci up
+
+      - name: Start api and worker
+        run: |
+          docker run -d --name api --network "$NETWORK" \
+            --env-file "$RUNNER_TEMP/app.env" \
+            -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
+            pulsego-api:ci
+          docker run -d --name worker --network "$NETWORK" \
+            --env-file "$RUNNER_TEMP/app.env" \
+            pulsego-worker:ci
+
+      - name: Wait for the image health checks
+        run: |
+          wait_healthy() {
+            local name="$1" deadline=$((SECONDS + 120)) status
+            while :; do
+              if [ "$(docker inspect -f '{{.State.Running}}' "$name")" != true ]; then
+                echo "$name is not running"
+                return 1
+              fi
+              status="$(docker inspect -f '{{.State.Health.Status}}' "$name")"
+              echo "$name: $status"
+              [ "$status" = healthy ] && return 0
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$name did not become healthy within 120s"
+                return 1
+              fi
+              sleep 3
+            done
+          }
+          wait_healthy api
+          wait_healthy worker
+
+      - name: Containers run as non-root
+        run: |
+          for name in api worker; do
+            uid="$(docker exec "$name" id -u)"
+            user="$(docker inspect -f '{{.Config.User}}' "$name")"
+            echo "$name: uid=$uid configured user=$user"
+            if [ "$uid" = 0 ] || [ -z "$user" ]; then
+              echo "$name must run as a non-root, explicitly configured user"
+              exit 1
+            fi
+          done
+
+      - name: Readiness reaches PostgreSQL
+        run: |
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9090/readyz)"
+          echo "/readyz: $code"
+          [ "$code" = 200 ]
+
+      - name: Dump container logs
+        if: failure()
+        run: |
+          for name in postgres api worker; do
+            echo "::group::$name"
+            docker logs "$name" 2>&1 || true
+            docker inspect -f '{{json .State.Health}}' "$name" 2>&1 || true
+            echo "::endgroup::"
+          done

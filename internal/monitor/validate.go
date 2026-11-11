@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // FieldError names one rejected field and says what was wrong with it.
@@ -54,13 +55,20 @@ type attributes struct {
 	expectedStatusMin int16
 	expectedStatusMax int16
 	failureThreshold  int16
+
+	// skipPolicy leaves out the SSRF policy check on the URL while keeping
+	// the syntactic ones. Update sets it when the request does not change
+	// the URL, so a monitor stored before the policy existed can still be
+	// renamed or disabled. The checker's security.Dialer still blocks such
+	// targets at check time. The zero value checks, so creates stay strict.
+	skipPolicy bool
 }
 
-func (a attributes) validate() error {
+func (a attributes) validate(policy security.Policy) error {
 	v := &ValidationError{}
 
 	a.validateName(v)
-	a.validateURL(v)
+	a.validateURL(v, policy)
 	a.validateInterval(v)
 	a.validateTimeout(v)
 	a.validateStatusRange(v)
@@ -87,11 +95,13 @@ func (a attributes) validateName(v *ValidationError) {
 	}
 }
 
-// validateURL checks syntax only. Whether the target is safe to contact —
-// loopback, private ranges, DNS rebinding — is decided by internal/security at
-// check time, not here: resolving DNS inside a request handler would be both
-// slow and a time-of-check/time-of-use trap.
-func (a attributes) validateURL(v *ValidationError) {
+// validateURL checks the syntax, then runs the SSRF policy's static check:
+// scheme, port 80/443, and no literal private, loopback, link-local or
+// reserved address, localhost or ambiguous numeric host. It deliberately does
+// no DNS — resolving inside a request handler would be slow and a
+// time-of-check/time-of-use trap. Host names are checked once resolved, by
+// the checker's security.Dialer, which is the real guarantee.
+func (a attributes) validateURL(v *ValidationError, policy security.Policy) {
 	raw := strings.TrimSpace(a.rawURL)
 	if raw == "" {
 		v.add("url", "is required")
@@ -117,6 +127,18 @@ func (a attributes) validateURL(v *ValidationError) {
 		v.add("url", "must not embed credentials")
 	case u.Fragment != "":
 		v.add("url", "must not include a fragment")
+	case a.skipPolicy:
+	default:
+		if err := policy.ValidateURL(raw); err != nil {
+			// The policy error names the host; the message stays generic so
+			// the response shape does not depend on internal/security's
+			// wording.
+			if policy.AllowPrivate {
+				v.add("url", "is not an allowed monitoring target")
+			} else {
+				v.add("url", "must be a public host on port 80 or 443; private, loopback, link-local and reserved addresses and localhost are not allowed")
+			}
+		}
 	}
 }
 

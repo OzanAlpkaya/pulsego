@@ -51,13 +51,18 @@ sqlc: ## Regenerate the type-safe query code from db/queries
 run-api: ## Run the API locally
 	$(GO) run ./cmd/api
 
-run-worker: ## Run the worker locally
-	$(GO) run ./cmd/worker
+# The worker's internal listener moves to :9091 so it does not collide with a
+# local api on :9090.
+run-worker: ## Run the worker locally (internal listener on :9091)
+	INTERNAL_HTTP_ADDR=:9091 $(GO) run ./cmd/worker
 
 test: ## Run unit tests with the race detector
 	$(GO) test -race ./...
 
-test-integration: ## Run integration tests (requires a Docker daemon)
+# Uses the PostgreSQL server in PULSEGO_TEST_DATABASE_URL when it is set
+# (creating and dropping its own pulsego_test_* databases); otherwise starts
+# PostgreSQL through Docker/Testcontainers.
+test-integration: ## Run integration tests (PULSEGO_TEST_DATABASE_URL, else Docker)
 	$(GO) test -race -tags integration -timeout 15m ./...
 
 lint: ## Run golangci-lint

@@ -1,7 +1,7 @@
-// Package telemetry wires the observability stack. For now that is only
-// structured logging; Prometheus metrics and OpenTelemetry tracing join it in
-// Sprint 5, and everything here must keep degrading gracefully when an
-// exporter is disabled or unreachable.
+// Package telemetry wires the observability stack: structured logging,
+// Prometheus metrics on a private registry, OpenTelemetry tracing over
+// OTLP/HTTP, and the pgx query tracer that feeds both. Everything here must
+// keep degrading gracefully when an exporter is disabled or unreachable.
 package telemetry
 
 import (

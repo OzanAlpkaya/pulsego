@@ -180,9 +180,9 @@ func (l *loader) validateCombinations(cfg Config) {
 			cfg.Worker.LeaseDuration, cfg.Checks.DefaultTimeout)
 	}
 
-	// Exporting traces without a destination silently drops them.
-	if cfg.Telemetry.OTelEnabled && cfg.Telemetry.OTLPEndpoint == "" {
-		l.errf("OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED is true")
+	// Exporting traces without a usable destination silently drops them.
+	if cfg.Telemetry.OTelEnabled {
+		l.otlpEndpoint("OTEL_EXPORTER_OTLP_ENDPOINT", cfg.Telemetry.OTLPEndpoint)
 	}
 
 	// Reaching private address space is a development-only affordance; see
@@ -331,6 +331,26 @@ func (l *loader) databaseURL(key string) string {
 		l.errf("%s must include a host", key)
 	}
 	return v
+}
+
+// otlpEndpoint checks the OTLP/HTTP base URL used when tracing is enabled:
+// it must be an http(s) URL with a host, such as http://otel-collector:4318.
+func (l *loader) otlpEndpoint(key, v string) {
+	if v == "" {
+		l.errf("%s is required when OTEL_ENABLED is true", key)
+		return
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		l.errf("%s is not a valid URL: %v", key, err)
+		return
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		l.errf("%s must use the http:// or https:// scheme, got %q", key, u.Scheme)
+	}
+	if u.Hostname() == "" {
+		l.errf("%s must include a host", key)
+	}
 }
 
 // poolSize derives the connection pool size from worker concurrency: every

@@ -10,6 +10,7 @@ import (
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/monitor"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // fakeStore records what the service asked for and returns canned results, so
@@ -138,7 +139,7 @@ func TestCreateAppliesDefaults(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeStore()
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	_, err := svc.Create(context.Background(), monitor.CreateInput{
 		Name: "  Example  ",
@@ -180,7 +181,7 @@ func TestCreateHonoursExplicitValues(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeStore()
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	_, err := svc.Create(context.Background(), monitor.CreateInput{
 		Name:              "Example",
@@ -212,7 +213,7 @@ func TestCreateRejectsInvalidWithoutTouchingStore(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeStore()
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	_, err := svc.Create(context.Background(), monitor.CreateInput{Name: "", URL: "nonsense"})
 
@@ -238,7 +239,7 @@ func TestUpdateValidatesAgainstMergedValues(t *testing.T) {
 		IntervalSeconds: 60, TimeoutMS: 30000,
 		ExpectedStatusMin: 200, ExpectedStatusMax: 399, FailureThreshold: 3,
 	}
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	_, err := svc.Update(context.Background(), id, monitor.UpdateInput{
 		IntervalSeconds: ptr(int32(10)),
@@ -263,7 +264,7 @@ func TestUpdatePassesOnlyRequestedFields(t *testing.T) {
 		IntervalSeconds: 60, TimeoutMS: 5000,
 		ExpectedStatusMin: 200, ExpectedStatusMax: 399, FailureThreshold: 3,
 	}
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	if _, err := svc.Update(context.Background(), id, monitor.UpdateInput{
 		Name: ptr("  Renamed  "),
@@ -296,7 +297,7 @@ func TestUpdatePropagatesNotFound(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeStore()
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	_, err := svc.Update(context.Background(), uuid.New(), monitor.UpdateInput{Name: ptr("x")})
 	if !errors.Is(err, domain.ErrNotFound) {
@@ -332,7 +333,7 @@ func TestListPagination(t *testing.T) {
 
 		store := newFakeStore()
 		store.page = makePage(4) // limit+1 rows available
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, next, err := svc.List(context.Background(), 3, nil)
 		if err != nil {
@@ -358,7 +359,7 @@ func TestListPagination(t *testing.T) {
 
 		store := newFakeStore()
 		store.page = makePage(2)
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, next, err := svc.List(context.Background(), 3, nil)
 		if err != nil {
@@ -381,7 +382,7 @@ func TestListPagination(t *testing.T) {
 			{requested: 1000, want: monitor.MaxPageSize},
 		} {
 			store := newFakeStore()
-			svc := monitor.NewService(store, testDefaults())
+			svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 			if _, _, err := svc.List(context.Background(), tc.requested, nil); err != nil {
 				t.Fatalf("List() returned an unexpected error: %v", err)
@@ -398,7 +399,7 @@ func TestDeleteDelegates(t *testing.T) {
 
 	id := uuid.New()
 	store := newFakeStore()
-	svc := monitor.NewService(store, testDefaults())
+	svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 	if err := svc.Delete(context.Background(), id); err != nil {
 		t.Fatalf("Delete() returned an unexpected error: %v", err)
@@ -450,4 +451,56 @@ func isNilPointer(v any) bool {
 	default:
 		return false
 	}
+}
+
+// TestUpdateChecksPolicyOnlyForNewURL covers monitors whose stored URL
+// predates the SSRF policy: they must stay editable (above all, disableable)
+// while a request that sets a disallowed URL is still rejected.
+func TestUpdateChecksPolicyOnlyForNewURL(t *testing.T) {
+	t.Parallel()
+
+	newSvc := func() (*fakeStore, *monitor.Service, uuid.UUID) {
+		id := uuid.New()
+		store := newFakeStore()
+		store.monitors[id] = domain.Monitor{
+			ID: id, Name: "Legacy", URL: "http://127.0.0.1/",
+			IntervalSeconds: 60, TimeoutMS: 5000,
+			ExpectedStatusMin: 200, ExpectedStatusMax: 399, FailureThreshold: 3,
+			Enabled: true,
+		}
+		return store, monitor.NewService(store, testDefaults(), security.Policy{AllowPrivate: false}), id
+	}
+
+	t.Run("disable without changing the URL", func(t *testing.T) {
+		t.Parallel()
+		store, svc, id := newSvc()
+
+		if _, err := svc.Update(context.Background(), id, monitor.UpdateInput{Enabled: ptr(false)}); err != nil {
+			t.Fatalf("Update(enabled=false) returned %v, want nil", err)
+		}
+		if store.updateParams == nil || store.updateParams.Enabled == nil || *store.updateParams.Enabled {
+			t.Fatalf("store got %+v, want Enabled=false", store.updateParams)
+		}
+		if store.updateParams.URL != nil {
+			t.Errorf("store got URL %q, want it left unchanged", *store.updateParams.URL)
+		}
+	})
+
+	t.Run("set a disallowed URL", func(t *testing.T) {
+		t.Parallel()
+		store, svc, id := newSvc()
+
+		_, err := svc.Update(context.Background(), id, monitor.UpdateInput{URL: ptr("http://10.0.0.1/")})
+
+		var verr *monitor.ValidationError
+		if !errors.As(err, &verr) {
+			t.Fatalf("Update(url) returned %v, want a *ValidationError", err)
+		}
+		if len(verr.Fields) != 1 || verr.Fields[0].Field != "url" {
+			t.Errorf("fields = %+v, want exactly one url error", verr.Fields)
+		}
+		if store.updateParams != nil {
+			t.Error("Update() reached the store despite failing validation")
+		}
+	})
 }

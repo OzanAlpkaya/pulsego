@@ -7,9 +7,9 @@ import (
 )
 
 // ErrorKind classifies why a check failed. The set of values is mirrored by
-// the monitor_checks_error_kind_valid CHECK constraint in
-// db/migrations/00003_create_monitor_checks.sql, so adding one here requires a
-// migration.
+// the monitor_checks_error_kind_valid CHECK constraint (created in
+// db/migrations/00003_create_monitor_checks.sql, last recreated in
+// 00005_error_kind_blocked.sql), so adding one here requires a migration.
 type ErrorKind string
 
 const (
@@ -28,6 +28,11 @@ const (
 	// ErrorKindUnexpectedStatus means a response arrived, but its status code
 	// was outside the monitor's expected range.
 	ErrorKindUnexpectedStatus ErrorKind = "unexpected_status"
+	// ErrorKindBlocked means the SSRF policy (internal/security) refused the
+	// target or a redirect hop before any connection was made to it: a
+	// private, loopback or otherwise non-public address, a disallowed port,
+	// or a URL the policy rejects.
+	ErrorKindBlocked ErrorKind = "blocked"
 	// ErrorKindUnknown is any failure that fits none of the other kinds.
 	ErrorKindUnknown ErrorKind = "unknown"
 )
@@ -36,7 +41,7 @@ const (
 func ErrorKinds() []ErrorKind {
 	return []ErrorKind{
 		ErrorKindTimeout, ErrorKindDNS, ErrorKindConnection, ErrorKindTLS,
-		ErrorKindRedirect, ErrorKindUnexpectedStatus, ErrorKindUnknown,
+		ErrorKindRedirect, ErrorKindUnexpectedStatus, ErrorKindBlocked, ErrorKindUnknown,
 	}
 }
 
@@ -44,7 +49,7 @@ func ErrorKinds() []ErrorKind {
 func (k ErrorKind) Valid() bool {
 	switch k {
 	case ErrorKindTimeout, ErrorKindDNS, ErrorKindConnection, ErrorKindTLS,
-		ErrorKindRedirect, ErrorKindUnexpectedStatus, ErrorKindUnknown:
+		ErrorKindRedirect, ErrorKindUnexpectedStatus, ErrorKindBlocked, ErrorKindUnknown:
 		return true
 	default:
 		return false

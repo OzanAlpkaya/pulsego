@@ -10,12 +10,11 @@ workers claim due monitors with `FOR UPDATE SKIP LOCKED` and hold time-bounded
 leases, so several workers can run without double-processing and a crashed
 worker's monitors become reclaimable on their own.
 
-> **Status: Sprint 4 of 6 complete.** Monitors can be registered, workers
-> check them on a schedule, and persistent failures open and resolve
-> incidents. SSRF protection and observability (Sprint 5) and the dashboard
-> plus the full README (Sprint 6) are still to come — until Sprint 5, do not
-> point the worker at untrusted monitor input. See `ROADMAP.md` and
-> `PROGRESS.md`.
+> **Status: Sprint 5 of 6 complete.** Monitors can be registered, workers
+> check them on a schedule behind SSRF protection, persistent failures open and
+> resolve incidents, and both binaries export Prometheus metrics and OTLP
+> traces. The dashboard and the full README (Sprint 6) are still to come. See
+> `ROADMAP.md` and `PROGRESS.md`.
 
 ## Quick start
 
@@ -221,8 +220,155 @@ Two rules are worth calling out:
   network.
 - `ALLOW_PRIVATE_TARGETS=true` is refused unless `ENVIRONMENT=development`. It
   lets monitors point at loopback and private addresses, which turns the checker
-  into an SSRF gadget against your own network. The protection it bypasses
-  arrives in Sprint 5.
+  into an SSRF gadget against your own network. See
+  [SSRF protection](#ssrf-protection).
+
+## SSRF protection
+
+A monitor makes the worker send requests to a URL chosen by an API client, so
+every outbound check is guarded by `internal/security` against server-side
+request forgery:
+
+- **What is blocked.** Unspecified (`0.0.0.0/8`, `::`), loopback
+  (`127.0.0.0/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`),
+  CGNAT (`100.64/10`), link-local (`169.254/16` — including the
+  `169.254.169.254` cloud metadata endpoint — and `fe80::/10`), multicast,
+  broadcast and reserved ranges, documentation and benchmarking ranges, IPv6
+  ULA and site-local, NAT64, 6to4 and Teredo. IPv4-mapped IPv6 addresses
+  (`::ffff:127.0.0.1`) are unmapped first. `localhost`, `*.localhost`,
+  ambiguous numeric hosts (`127.1`, `2130706433`, `0x7f.0.0.1`), IPv6 zone
+  identifiers and URLs with credentials are rejected too.
+- **Ports.** Only 80 and 443 (or none, meaning the scheme default).
+- **At the API.** Create and update validate `url` statically — no DNS — and
+  answer 422 on field `url` for a blocked target. An update that does not set
+  `url` skips this policy check (the syntax checks still run). That way a
+  monitor stored before the policy existed can still be renamed or disabled.
+  The dialer still blocks it at check time.
+- **At check time.** The dialer resolves the host **once**, rejects it if
+  *any* answer is blocked, and then dials only the validated IP literals, so a
+  DNS-rebinding second lookup can never happen. The socket address is checked
+  again right before `connect`.
+- **Redirects.** At most 5, and every hop is validated again, statically and
+  by the dialer; a redirect to a private address is never dialled.
+- A refused check is stored with `error_kind` `blocked`. Stored error messages
+  never contain the URL or its query string.
+
+`ALLOW_PRIVATE_TARGETS=true` turns the address, `localhost` and port checks
+off (resolve-then-dial-the-IP still applies). It exists so you can monitor a
+service on your own machine during development, and the config refuses it
+outside `ENVIRONMENT=development`: with it on, anyone holding the API key can
+make the worker reach internal services, admin ports and cloud metadata
+credentials from inside your network, and read back status codes and timings.
+
+## Observability
+
+### Health and readiness
+
+- **`/healthz`** never touches the database. It answers 200 as long as the
+  process serves HTTP, so it is the liveness probe: the Docker `HEALTHCHECK`
+  calls it.
+- **`/readyz`** pings PostgreSQL with a 2-second timeout. It answers 200
+  `{"status":"ready"}`, or 503 problem+json of type
+  `urn:pulsego:problem:not-ready`. The body says only that a dependency is
+  unavailable; the actual error goes to the log at warn. Use it to route traffic, not to restart a process.
+
+Both answer GET and HEAD without the API key. The api serves them on
+`HTTP_ADDR` and on `INTERNAL_HTTP_ADDR`; the worker has no public listener and
+serves them on `INTERNAL_HTTP_ADDR` only.
+
+### Metrics
+
+`/metrics` (GET) is served on **`INTERNAL_HTTP_ADDR`** only (default `:9090`),
+by both the api and the worker — never on the public port. Each binary uses
+its own registry with all ten metrics, plus the Go runtime and process
+collectors:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `pulsego_http_requests_total` | counter | `method`, `route`, `code` |
+| `pulsego_http_request_duration_seconds` | histogram | `method`, `route` |
+| `pulsego_monitor_checks_total` | counter | `result` (`success`/`failure`), `error_kind` (`none` or the kind) |
+| `pulsego_monitor_check_duration_seconds` | histogram | `result` |
+| `pulsego_monitor_state_total` | counter | `from`, `to` (only real changes) |
+| `pulsego_worker_claimed_monitors_total` | counter | — |
+| `pulsego_worker_active_checks` | gauge | — |
+| `pulsego_worker_claim_errors_total` | counter | — |
+| `pulsego_scheduler_lag_seconds` | histogram | — (claim time − `next_check_at`, ≥ 0) |
+| `pulsego_db_operation_duration_seconds` | histogram | `operation` (sqlc query name, else `other`), `outcome` (`ok`/`error`) |
+
+Every label value comes from a fixed set, so cardinality stays bounded:
+
+- `method` is one of the standard methods, else `OTHER`.
+- `route` is the chi route pattern (`/v1/monitors/{id}`), else `unmatched`.
+  A `/v1` request rejected by the API key check never reaches its route, so
+  it is counted as `/v1/*`.
+- `code` is the 3-digit status.
+- `error_kind` and the states are checked against the domain enums, else
+  `unknown`.
+
+URLs, monitor IDs, error messages and request IDs are never labels.
+
+The HTTP metrics count the api's public routes only; the internal listener is
+not instrumented, so scrapes and probes are not counted. A metric with labels
+shows up in `/metrics` only after its first observation:
+
+- The HTTP metrics appear after the first public request. The worker has no
+  public router, so its `/metrics` never shows them; it shows the other 8.
+- `pulsego_db_operation_duration_seconds` appears after the first query. The
+  `/readyz` ping is not a query, so it does not count.
+- The check and state counters are pre-created at zero for every known label
+  value, so they are there from the start.
+
+```bash
+curl -s localhost:9090/metrics | grep '^pulsego_'
+```
+
+### Tracing
+
+Tracing is off by default (`OTEL_ENABLED=false`). Then no exporter is
+created and nothing goes over the network. With `OTEL_ENABLED=true`, spans go
+over OTLP/HTTP (protobuf) to `OTEL_EXPORTER_OTLP_ENDPOINT`. It must be a full
+http(s) URL, such as `http://otel-collector:4318`; the config refuses to start
+without one. Setup never dials, so an unreachable collector cannot block
+startup or requests: export errors are logged at warn, and the final flush is
+bounded by `SHUTDOWN_TIMEOUT`. The trace service names are
+`<SERVICE_NAME>-api` and `<SERVICE_NAME>-worker` (by default `pulsego-api`
+and `pulsego-worker`).
+
+Spans:
+
+- **Incoming requests:** `"<METHOD> <route>"`.
+- **PostgreSQL:** `db <operation>`, with no statement text or arguments.
+- **Worker claim cycles:** `scheduler.claim`.
+- **Each check:** a `scheduler.check` trace with the children
+  `checker.check` (the outbound request) and `monitor.record`.
+  `monitor.record` carries the `incident.opened` and `incident.resolved`
+  events.
+
+No span carries headers, query strings, bodies or the API key.
+
+### Local stack
+
+```bash
+docker compose -f deployments/compose.yaml --profile observability up --build
+```
+
+This adds an OpenTelemetry Collector, Jaeger, Prometheus and Grafana to the
+usual stack (`deployments/compose.yaml`):
+
+| UI | URL | Override |
+|---|---|---|
+| Jaeger | http://localhost:16686 | `JAEGER_UI_PORT` |
+| Prometheus | http://localhost:9092 | `PROMETHEUS_PORT` |
+| Grafana | http://localhost:3000 (anonymous viewer, Prometheus datasource provisioned) | `GRAFANA_PORT` |
+
+Prometheus scrapes `api:9090` and `worker:9090` inside the Compose network.
+Traces only arrive in Jaeger if you also turn tracing on:
+
+```bash
+OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+  docker compose -f deployments/compose.yaml --profile observability up --build
+```
 
 ## Development
 
@@ -253,6 +399,18 @@ Developer tools (`sqlc`, `golangci-lint`, `govulncheck`) are pinned as go.mod
 `tool` directives, so a bare checkout needs nothing installed beyond Go and
 Docker.
 
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request, in three jobs:
+
+- **`checks`:** `gofmt`, `go mod tidy -diff`, `sqlc diff`, `go vet` and
+  `golangci-lint` (each also with the `integration` tag), `go test -race`,
+  `govulncheck`, and the three `go build -o bin/...` builds.
+- **`integration`:** the integration suite in Testcontainers mode.
+- **`docker`:** builds the api, worker and migrate images. It runs them
+  against PostgreSQL and waits for both health checks to pass. It then checks
+  that the containers run as non-root and that `/readyz` returns 200.
+
 ## Layout
 
 ```
@@ -263,7 +421,7 @@ internal/httpapi           routing, middleware, handlers
 internal/repository        pgxpool setup + sqlc-generated queries
 internal/{monitor,checker,scheduler,security,telemetry}
 db/{migrations,queries}    goose migrations, sqlc query sources
-deployments/               Dockerfile, Compose stack
+deployments/               Dockerfile, Compose stack, Prometheus/OTel/Grafana config
 ```
 
 No ORM: the SQL lives in `db/queries` and `sqlc` compiles it into type-safe Go.

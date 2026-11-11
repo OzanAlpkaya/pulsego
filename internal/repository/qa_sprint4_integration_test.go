@@ -18,6 +18,7 @@ import (
 	"github.com/OzanAlpkaya/pulsego/internal/httpapi"
 	"github.com/OzanAlpkaya/pulsego/internal/monitor"
 	"github.com/OzanAlpkaya/pulsego/internal/repository"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 // TestQAConcurrentRetentionCleanersDeleteEachRowOnce (Sprint 4 QA, D8): several
@@ -114,7 +115,7 @@ func TestQAIncidentHistoryEndpointAfterRecord(t *testing.T) {
 	router := httpapi.NewRouter(
 		httpapi.RouterConfig{
 			APIKey:   apiKey,
-			Monitors: monitor.NewService(store, monitor.Defaults{IntervalSeconds: 60, TimeoutMS: 5000}),
+			Monitors: monitor.NewService(store, monitor.Defaults{IntervalSeconds: 60, TimeoutMS: 5000}, security.Policy{}),
 		},
 		slog.New(slog.NewJSONHandler(io.Discard, nil)),
 	)

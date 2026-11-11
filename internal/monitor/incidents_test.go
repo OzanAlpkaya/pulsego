@@ -10,6 +10,7 @@ import (
 
 	"github.com/OzanAlpkaya/pulsego/internal/domain"
 	"github.com/OzanAlpkaya/pulsego/internal/monitor"
+	"github.com/OzanAlpkaya/pulsego/internal/security"
 )
 
 func TestListIncidentsPagination(t *testing.T) {
@@ -38,7 +39,7 @@ func TestListIncidentsPagination(t *testing.T) {
 
 		store, id := withMonitor()
 		store.incidents = makeIncidents(id, 4)
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		cursor := &monitor.IncidentCursor{StartedAt: base.Add(time.Hour), ID: uuid.New()}
 		got, next, err := svc.ListIncidents(context.Background(), id, 3, cursor)
@@ -71,7 +72,7 @@ func TestListIncidentsPagination(t *testing.T) {
 
 		store, id := withMonitor()
 		store.incidents = makeIncidents(id, 2)
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, next, err := svc.ListIncidents(context.Background(), id, 3, nil)
 		if err != nil {
@@ -86,7 +87,7 @@ func TestListIncidentsPagination(t *testing.T) {
 		t.Parallel()
 
 		store, id := withMonitor()
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		got, next, err := svc.ListIncidents(context.Background(), id, 3, nil)
 		if err != nil {
@@ -101,7 +102,7 @@ func TestListIncidentsPagination(t *testing.T) {
 		t.Parallel()
 
 		store := newFakeStore()
-		svc := monitor.NewService(store, testDefaults())
+		svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 		_, _, err := svc.ListIncidents(context.Background(), uuid.New(), 3, nil)
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -120,7 +121,7 @@ func TestListIncidentsPagination(t *testing.T) {
 			{requested: 1000, want: monitor.MaxPageSize},
 		} {
 			store, id := withMonitor()
-			svc := monitor.NewService(store, testDefaults())
+			svc := monitor.NewService(store, testDefaults(), security.Policy{})
 
 			if _, _, err := svc.ListIncidents(context.Background(), id, tc.requested, nil); err != nil {
 				t.Fatalf("ListIncidents() returned an unexpected error: %v", err)
