@@ -1,7 +1,7 @@
 # PulseGo — Progress
 
 Last updated: 2026-11-11
-Current sprint: **Sprint 5 — Production Hardening** done, awaiting review/merge
+Current sprint: all 6 sprints done, Sprint 6 awaiting review/merge
 
 ---
 
@@ -1100,7 +1100,7 @@ Notes:
 
 ## Sprint 5 — Production Hardening
 Status: **Done** (2026-11-11)
-Branch: `feature/sprint-05-hardening`
+Branch: `feature/sprint-05-hardening` — squash-merged into `main` as `44b0461`
 
 Definition of Done:
 - [x] SSRF test suite covers loopback/private/link-local/redirect-to-private
@@ -1576,7 +1576,24 @@ Notes:
     - every package `ok`, rc=0 (repository 2.165s, scheduler 1.866s);
     - no race-runtime linker flake, so `-p 1` was not needed;
     - leftover `pulsego_test_*` databases: **0**.
-  - **Binary smoke test.** Setup:
+  - `make help` → rc=0, lists all 22 targets; `demo` reads "caller passes
+    ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true (local only)".
+  - D10 refusal:
+    - `scripts/demo.sh` and `make demo` with both variables unset → `demo:
+      refusing to start …`, exit 2;
+    - `ENVIRONMENT=production ALLOW_PRIVATE_TARGETS=true scripts/demo.sh`
+      → exit 2;
+    - no api, worker or targets process was started.
+  - D9 precedence, checked with a temporary `.env` copied from
+    `.env.example` (removed afterwards) and a probe target that prints
+    the variables:
+    - with no variables set, `.env` gives `ALLOW_PRIVATE_TARGETS=false`;
+    - `ALLOW_PRIVATE_TARGETS=true ENVIRONMENT=development make …` →
+      `true`;
+    - `make … LOG_LEVEL=debug ALLOW_PRIVATE_TARGETS=true` → both win;
+    - `make demo` with that `.env` and no variables → still exit 2.
+  - **Binary smoke test** (run with the `ab54a63` binaries; the merge
+    changed no Go code). Setup:
     - a scratch database `pulsego_smoke` on the sandbox server;
     - `bin/migrate up` → `successfully migrated database to version: 5`;
     - `bin/api` on `127.0.0.1:18080` / internal `127.0.0.1:19090`;
@@ -1627,14 +1644,302 @@ Notes:
 ---
 
 ## Sprint 6 — Portfolio Polish
-Status: **Not Started**
-Branch: `feature/sprint-06-polish`
+Status: **Done** (2026-11-11)
+Branch: `feature/sprint-06-polish` (agent-office implements the sprint on
+per-task branches merged into one integration branch; that branch is
+squash-merged into `main` as `feature/sprint-06-polish` after user approval)
 
 Definition of Done:
-- [ ] Dashboard renders live state from the API
-- [ ] README is sufficient for another developer to run and understand the
-      project unaided
-- [ ] Project-level Definition of Done (ROADMAP.md §9) fully satisfied
+- [x] Dashboard renders live state from the API
+      (`TestDashboardIndexNeedsNoAPIKey`, `TestDashboardServesStaticFiles`,
+      `TestDashboardMissingFilesAre404`, `TestDashboardDoesNotOpenTheAPI`,
+      `TestDashboardIndexIsCSPCompatible`, `TestOpenAPIMatchesRouter`,
+      `TestNormalizeRoute`; `docs/screenshots/dashboard.png`,
+      `incident-open.png`, `incident-resolved.png` and `docs/demo.gif`
+      captured from a live api + worker by `scripts/demo.sh`; plus the
+      dashboard routes in the smoke test in the Notes)
+- [x] README is sufficient for another developer to run and understand the
+      project unaided (every ROADMAP Sprint 6 README topic has its own
+      section, including "Key Engineering Decisions" with all six required
+      subsections, the Mermaid diagram, the CI badge and the screenshots;
+      the smoke test in the Notes followed "Running locally without
+      Compose". The from-scratch walkthrough is the D8 QA step; the Compose
+      quick start needs Docker — **waiting for CI after push**, see Notes)
+- [x] Project-level Definition of Done (ROADMAP.md §9) fully satisfied
+      (item by item in the Notes; the Docker and GitHub Actions items are
+      **waiting for CI after push**)
 
 Notes:
--
+- Plan approved 2026-11-11 (approval given in advance by the user for this
+  sprint; the user reviews these decisions before the squash-merge).
+  Implementation runs in agent-office, following the D8 work order below.
+  The decisions below are binding and self-contained — an implementer should
+  not need the planning conversation. Anything not settled here is a question
+  for the user, not a guess.
+- Decisions taken at sprint start (D1–D8 of the approved plan):
+  - **D1 — Dashboard: static files, embedded, data from `/v1` only.**
+    - **Files:** static HTML + CSS + vanilla JS in `web/static/`. No build
+      step, no Node, no framework, no CDN.
+    - **Embedding:** a `web` package (`web/embed.go`) embeds `web/static/`
+      with `//go:embed`.
+    - **Routes:** the api's public router serves `GET /` (`index.html`) and
+      `GET /static/*`. These routes carry no data and need no API key.
+    - **Data:** only the existing `/v1` endpoints — the monitor list,
+      per-monitor `stats?window=24h` and per-monitor incidents. No new API
+      endpoints, no server-side data rendering.
+    - **API key:**
+      - The user enters it in a form.
+      - It is kept in `sessionStorage` only and sent in the existing auth
+        header.
+      - It is never placed in a URL and never logged (Rule 10).
+    - **Per monitor it shows:**
+      - name;
+      - target host — the host only, never the query or userinfo;
+      - state badge;
+      - uptime % (24h) and p95 latency (24h);
+      - last check: time, latency and status.
+    - **Recent incidents list:** open/resolved, monitor, started, duration,
+      cause.
+    - **Behaviour:** auto-refresh every 10 s. Empty, loading and error
+      states; a 401 re-prompts for the key.
+    - **XSS:** every string from the API is inserted with `textContent`.
+      No `innerHTML` with data.
+    - **Response headers** on the dashboard routes:
+      - `Content-Security-Policy: default-src 'self'` (so no inline script
+        or style);
+      - `X-Content-Type-Options: nosniff`;
+      - `Referrer-Policy: no-referrer`.
+    - **Metrics:** the new routes keep the `route` label bounded — the chi
+      templates `/` and `/static/*`.
+  - **D2 — IPv6 special-use ranges** left open by Sprint 5 D1 are now
+    blocked in `security.BlockedReason`:
+    - `::/96` — IPv4-compatible (deprecated);
+    - `100::/64` — discard-only;
+    - `2001:10::/28` — ORCHID (deprecated).
+    - `::` keeps its "unspecified" reason and `::1` its "loopback" reason:
+      the specific ranges are checked first.
+    - Tests: table tests in `internal/security`, plus a dialer test.
+  - **D3 — Demo tooling in a nested Go module `demo/`** (its own `go.mod`).
+    chromedp therefore never enters the main module's dependency graph,
+    `go test ./...`, the govulncheck scope or the binaries.
+    - `demo/cmd/targets` serves local demo targets: one steady, one slow,
+      and one that goes down and comes back on a schedule.
+    - `demo/cmd/capture` drives headless Chromium with chromedp.
+    - `scripts/demo.sh` orchestrates the whole run:
+      1. migrate;
+      2. start api + worker with `ALLOW_PRIVATE_TARGETS=true` (local demo
+         only, Rule 8);
+      3. start the targets;
+      4. seed;
+      5. capture;
+      6. build the GIF with ffmpeg;
+      7. clean up.
+    - `scripts/seed-demo.sh` seeds monitors with curl against any running
+      API (`API_URL`, `API_KEY`, optional target base URL).
+    - Outputs:
+      - `docs/screenshots/dashboard.png`;
+      - `docs/screenshots/incident-open.png`;
+      - `docs/screenshots/incident-resolved.png`;
+      - `docs/demo.gif` (< 5 MB).
+    - Makefile targets `demo-seed` and `demo`.
+  - **D4 — README rewrite.** It covers every item of the ROADMAP Sprint 6
+    scope, including:
+    - a "Key Engineering Decisions" section;
+    - an architecture diagram in Mermaid;
+    - a CI status badge
+      (`https://github.com/OzanAlpkaya/pulsego/actions/workflows/ci.yml/badge.svg`);
+    - the dashboard, with the screenshots and the GIF.
+  - **D5 — Scope limits.** No new services, no ORM, no new API endpoints,
+    no schema change. `api/openapi.yaml` changes only if needed to document
+    the dashboard routes as non-API; otherwise the route-coverage test
+    exempts them with a stated reason.
+  - **D6 — Project-level DoD (ROADMAP §9).** Each item gets an evidence
+    line in these Notes: test names, gate output, or a CI job. Items that
+    need Docker or GitHub Actions are marked **waiting for CI after push**,
+    as in Sprint 5.
+  - **D7 — Close-out gate.** The full `/sprint-done` gate, plus the
+    integration suite run with `PULSEGO_TEST_DATABASE_URL` (local
+    PostgreSQL 17, no Docker). The results are recorded in these Notes.
+  - **D8 — Work order:**
+    1. this plan, the IPv6 ranges (D2) and the dashboard (D1), in
+       parallel;
+    2. demo tooling and captures (D3);
+    3. README (D4);
+    4. close-out gate (D7);
+    5. QA — which also follows the README local setup from scratch.
+- Decisions taken during the sprint (follow-ups `301db2c` and `8de25be`):
+  - **D9 — Values already in the environment win over `.env`.** The
+    Makefile's `.env` include now lets values already in the environment
+    (`VAR=value make …`) and make arguments (`make … VAR=value`) win over
+    `.env`, for every variable. This is dotenv behaviour. So a `.env` copied
+    from `.env.example` cannot silently override a command-line opt-in. The
+    environment values are saved before the include and restored,
+    unexpanded, after it.
+  - **D10 — The caller opts in to `ALLOW_PRIVATE_TARGETS`; `demo.sh` never
+    sets it.** This supersedes D3 step 2. The caller must run
+    `ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true make demo` (local
+    demo only). Otherwise `scripts/demo.sh` exits 2 before it starts
+    anything (Rule 8). No committed file sets `ALLOW_PRIVATE_TARGETS=true`;
+    `git grep` finds it only in comments, docs, usage text and config tests.
+    The README demo section and the `.env` precedence note were aligned in
+    `8de25be`.
+- **Gate results (2026-11-11)**, D7, run on `8487b85`. That is the
+  close-out branch with `8de25be` merged in, so it holds all Sprint 6 work:
+  the plan, the IPv6 ranges, the dashboard, the demo, the README and the
+  D9/D10 follow-ups. Run in the agent-office sandbox (Go 1.27.4,
+  `GOTOOLCHAIN=local`). A first run on `ab54a63` gave the same results;
+  the merge changes only `Makefile`, `README.md`, `scripts/demo.sh` and
+  `scripts/seed-demo.sh`, with no Go code. Nothing needed fixing, so this
+  close-out changes only `PROGRESS.md`.
+  - `gofmt -l .` → empty.
+  - `go vet ./...` → rc=0 (also rc=0 with `-tags integration`).
+  - `go tool golangci-lint run` (v2.15.0) → `0 issues.` in 2.0s (also
+    `0 issues.` with `--build-tags integration`).
+  - `go test -race -count=1 ./...` → `ok` for checker, config, domain,
+    httpapi, monitor, scheduler, security and telemetry; 172 top-level tests
+    passed, 0 skipped, 0 failed; rc=0, about 12s wall-clock.
+  - `go tool govulncheck ./...` (v1.7.0, DB `https://vuln.go.dev`) →
+    `No vulnerabilities found.`, rc=0. No waiver needed.
+  - `go build -o bin/api ./cmd/api`, `go build -o bin/worker ./cmd/worker`,
+    `go build -o bin/migrate ./cmd/migrate` → all rc=0.
+  - Nested demo module: `cd demo && go vet ./... && go build ./...` → both
+    rc=0.
+  - `go mod tidy` → no diff in `go.mod`/`go.sum`. `go tool sqlc diff` →
+    rc=0, no diff.
+  - **Integration suite, `PULSEGO_TEST_DATABASE_URL` mode** (local
+    PostgreSQL 17 via `pg-test-up`, no Docker),
+    `go test -race -tags integration -count=1 -timeout 15m ./...`:
+    - every package `ok`, rc=0, about 6s wall-clock (repository 2.150s,
+      scheduler 1.864s);
+    - 229 top-level tests passed, 0 skipped, 0 failed (`-v` re-run), so
+      no integration test fell back to Testcontainers or skipped;
+    - no race-runtime linker flake, so `-p 1` was not needed;
+    - leftover `pulsego_test_*` databases: **0**.
+  - **Binary smoke test.** Setup:
+    - a scratch database `pulsego_smoke` on the sandbox server, dropped
+      afterwards;
+    - `bin/migrate up` → `successfully migrated database to version: 5`;
+    - `bin/api` on `127.0.0.1:18080` / internal `127.0.0.1:19090`;
+    - `bin/worker` on internal `127.0.0.1:19091`, `WORKER_POLL_INTERVAL=2s`;
+    - both with `OTEL_ENABLED=false` and the default
+      `ALLOW_PRIVATE_TARGETS=false`.
+  - Smoke-test results:
+    - `/healthz` → 200 `{"status":"ok"}` and `/readyz` → 200
+      `{"status":"ready"}` on the api public port, the api internal port
+      and the worker internal port.
+    - `/metrics` → 200 on both internal ports, 404 on the api public port.
+      After the run the api exposed 10 `pulsego_*` metric names and the
+      worker 8 (metrics 3–10), as W1 expects.
+    - Dashboard: `GET /` → 200 `text/html`, `<title>PulseGo — Dashboard</title>`,
+      with `Content-Security-Policy: default-src 'self'; base-uri 'none';
+      form-action 'none'; frame-ancestors 'none'`,
+      `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+      `/static/style.css`, `/static/app.js` and `/static/favicon.svg` → 200
+      with the right content types. `web/static/app.js` contains no
+      `innerHTML`.
+    - `POST /v1/monitors` for `http://127.0.0.1:18080/healthz` → 422
+      `validation-error`, field `url` (private target rejected by default).
+    - `POST /v1/monitors` for `https://example.com` → 201, `state`
+      `unknown`. Within 0.1s, with no manual trigger, the worker claimed and
+      checked it: `GET /v1/monitors/{id}/checks` returned one stored result,
+      and the monitor showed `last_checked_at` set, `consecutive_failures` 1,
+      `state` `degraded` and `next_check_at` 30s later. The result is
+      `error_kind` `dns`, because the sandbox has no outbound network; the
+      worker's `pulsego_monitor_checks_total{error_kind="dns",result="failure"}`
+      was 1.
+    - The API key does not appear in either log (`grep -c` → 0 for both).
+    - SIGTERM to both → api `server stopped` (public, internal) …
+      `stopped`; worker `scheduler stopping` … `scheduler stopped` …
+      `server stopped` … `stopped`.
+  - **No secrets committed** — scan of the working tree and all 13 commits
+    of the history (`git grep` over `git rev-list --all`):
+    - private-key headers, AWS `AKIA…`, GitHub `ghp_`/`github_pat_`, Slack
+      `xox?-`, `sk-…` and Google `AIza…` patterns → no hits;
+    - no `.env`, `*.pem`, `*.key`, `id_rsa` or credentials file was ever
+      committed; the only env file is `.env.example`. `.env` and `.env.*`
+      are git-ignored (except `.env.example`), and `.env` is also in
+      `.dockerignore`;
+    - `password`/`secret`/`token`/`api_key` assignments → only documented
+      local or throwaway values: `POSTGRES_PASSWORD: pulsego` for the local
+      Compose and CI database, `API_KEY=local-development-api-key`
+      (`.env.example`, the Compose default, README), and
+      `API_KEY=ci-only-throwaway-api-key` (CI). `scripts/demo.sh` generates
+      a random key per run.
+- **Project-level Definition of Done (ROADMAP §9)**, item by item. The CI
+  jobs are in `.github/workflows/ci.yml`: `checks` (gofmt, vet, lint,
+  `go test -race`, govulncheck, the three builds), `integration` (the
+  suite in Testcontainers mode) and `docker` (builds the images, runs
+  postgres + migrate + api + worker with the Compose settings, waits for
+  `healthy`, checks the non-root UID and `/readyz`).
+  - `docker compose up` starts postgres/api/worker — **waiting for CI
+    after push**: no Docker in the sandbox. The CI job `docker` runs the
+    same images and settings as `deployments/compose.yaml` with
+    `docker run`; `docker compose up` itself needs a Docker host (it was
+    verified in Sprint 1, and the compose file has not changed since
+    Sprint 5).
+  - A monitor can be created via API — `TestCreateMonitor`,
+    `TestCreateAndGet`, `TestCreateAppliesDefaults`,
+    `TestCreateHonoursExplicitValues`, `TestCreateMonitorRejectsBadBodies`;
+    smoke test (201).
+  - A worker claims and checks it automatically —
+    `TestSchedulerEndToEnd`, `TestClaimSkipsDisabledDeletedAndNotDue`,
+    `TestClaimRespectsBatchSize`, `TestNeverClaimsMoreThanFreeSlots`; smoke
+    test (checked with no manual trigger).
+  - Results/latency history persisted — `TestRecordCheckResult`,
+    `TestListChecksKeysetPagination`, `TestListChecksEndpoint`,
+    `TestMonitorStatsWindows`, `TestMonitorStatsEndpoint`,
+    `TestMonitorChecksConstraints`, `TestDeleteExpiredChecks`; smoke test
+    (`/checks` returned the stored result).
+  - Repeated failures open an incident —
+    `TestRecordLifecycleOpensAndResolvesIncident`, `TestTransition`,
+    `TestTransitionCoversEveryAllowedEdge`,
+    `TestIncidentsOneUnresolvedPerMonitor`,
+    `TestIncidentsConcurrentUnresolvedInsert`,
+    `TestRecordWithIncidentAlreadyOpen`,
+    `TestQAIncidentHistoryEndpointAfterRecord`.
+  - Recovery resolves it — `TestRecordLifecycleOpensAndResolvesIncident`,
+    `TestRecordSpanIncidentResolved`, `TestTransition`.
+  - Multiple workers never double-process a leased monitor —
+    `TestClaimParallelClaimersNeverDoubleAssign`,
+    `TestClaimSkipsRowsLockedByOpenTransaction`,
+    `TestClaimIgnoresActiveLease`, `TestRecordConcurrentResultsForOneMonitor`,
+    `TestRecordReadsStateUnderRowLock`, `TestLeaseLostIsLoggedAndSwallowed`.
+  - Expired leases are reclaimable —
+    `TestExpiredLeaseReclaimedByDifferentWorker`,
+    `TestClaimLeaseCoversMonitorTimeout`,
+    `TestChecksRunningAtShutdownTimeoutAreReleased`, `TestReleaseLease`.
+  - Private/unsafe targets rejected by default — the Sprint 5 SSRF suite
+    (`TestValidateURL`, `TestBlockedReason`, `TestDialerRejectsPrivateAnswer`,
+    `TestDialerRejectsMixedAnswers`, `TestRedirectToPrivateIsBlocked`,
+    `TestCheckerBlocksLoopbackTarget`, `TestCreateMonitorRejectsPrivateTarget`,
+    `TestUpdateChecksPolicyOnlyForNewURL`,
+    `TestQALegacyUnsafeMonitorBlockedEndToEnd`) with the D2 IPv6 ranges
+    in `TestBlockedReason`; smoke test (422 for a loopback target).
+  - Health/readiness/metrics endpoints work — `TestHealthz`,
+    `TestReadyz`, `TestReadyzBoundsThePing`, `TestReadyzWithDatabase`,
+    `TestHealthEndpointsAreUnauthenticated`,
+    `TestInternalRouterServesMetrics`, `TestPublicRouterDoesNotServeMetrics`,
+    `TestMetricsAllTenRegistered`; smoke test (all three binaries' ports).
+    Image health checks: CI job `docker` — **waiting for CI after push**.
+  - API documented via OpenAPI — `api/openapi.yaml` (3.1);
+    `TestOpenAPIIsWellFormed`, `TestOpenAPIMatchesRouter`,
+    `TestHealthIsDocumentedAsUnauthenticated`.
+  - Unit + integration tests pass — gate above: 172 unit tests and 229
+    tests with `-tags integration` (`PULSEGO_TEST_DATABASE_URL` mode), all
+    green. Testcontainers mode: CI job `integration` — **waiting for CI
+    after push**.
+  - Race detector passes — both runs above use `-race`; CI job `checks`
+    runs it too.
+  - CI builds both binaries + the Docker image — **waiting for CI after
+    push**: CI jobs `checks` (the three `go build` steps) and `docker`
+    (`docker build -f deployments/Dockerfile` per binary). The same three
+    builds pass locally (gate above).
+  - No secrets committed — scan above: no hits.
+  - README is sufficient standalone — Sprint 6 DoD item 2 above. The
+    from-scratch walkthrough is the D8 QA step; the Compose quick start is
+    **waiting for CI after push** / a Docker host.
+- **Waiting for CI after push** (no Docker or GitHub Actions in the
+  sandbox): `docker compose up`, the Docker image build, non-root user and
+  health checks (job `docker`), the CI pipeline itself (job `checks`) and
+  the Testcontainers integration run (job `integration`). Everything else
+  passed here. No new waiver: only W1 (Sprint 5) applies.

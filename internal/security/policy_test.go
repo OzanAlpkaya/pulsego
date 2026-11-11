@@ -73,6 +73,10 @@ func TestValidateURL(t *testing.T) {
 		{"private 192.168", "https://192.168.1.1/", false, false},
 		{"unspecified", "http://0.0.0.0/", false, false},
 		{"ULA", "http://[fd00::1]/", false, false},
+		{"discard-only", "http://[100::1]/", false, false},
+		{"IPv4-compatible loopback", "http://[::7f00:1]/", false, false},
+		{"IPv4-compatible dotted", "http://[::127.0.0.1]/", false, false},
+		{"ORCHID", "http://[2001:10::1]/", false, false},
 		{"loopback AllowPrivate", "http://127.0.0.1:8080/", true, true},
 	}
 	for _, tc := range tests {
@@ -112,6 +116,9 @@ func TestBlockedReason(t *testing.T) {
 		"2001::1",
 		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254",
 		"fe80::1%eth0",
+		"::2", "::7f00:1", "::a00:1", "::a9fe:a9fe", "::ffff", "::ffff:ffff",
+		"100::", "100::1", "100::1:0:0:0", "100::ffff:ffff:ffff:ffff",
+		"2001:10::", "2001:10::1", "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
 	}
 	for _, s := range blockedAddrs {
 		t.Run("blocked "+s, func(t *testing.T) {
@@ -129,6 +136,8 @@ func TestBlockedReason(t *testing.T) {
 		"198.17.255.255", "198.20.0.0", "192.0.1.1", "223.255.255.255",
 		"2606:4700::1111", "2a00:1450:4001::1", "::ffff:93.184.215.14",
 		"2001:4860:4860::8888",
+		"::1:0:0", "100:0:0:1::", "ff::ffff:ffff:ffff:ffff",
+		"2001:20::", "2001:20::1",
 	}
 	for _, s := range allowed {
 		t.Run("allowed "+s, func(t *testing.T) {
@@ -145,6 +154,31 @@ func TestBlockedReason(t *testing.T) {
 			t.Fatal("zero Addr must be blocked")
 		}
 	})
+}
+
+func TestBlockedReasonStrings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ addr, reason string }{
+		{"::", "unspecified address"},
+		{"::1", "loopback address"},
+		{"::2", "IPv4-compatible IPv6 address (deprecated)"},
+		{"::7f00:1", "IPv4-compatible IPv6 address (deprecated)"},
+		{"::a00:1", "IPv4-compatible IPv6 address (deprecated)"},
+		{"::ffff:127.0.0.1", "loopback address"},
+		{"100::1", "discard-only address"},
+		{"2001:10::1", "ORCHID address (deprecated)"},
+		{"2001::1", "Teredo address"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.addr, func(t *testing.T) {
+			t.Parallel()
+			reason, isBlocked := BlockedReason(netip.MustParseAddr(tc.addr))
+			if !isBlocked || reason != tc.reason {
+				t.Fatalf("BlockedReason(%s) = %q, %v; want %q, true", tc.addr, reason, isBlocked, tc.reason)
+			}
+		})
+	}
 }
 
 func TestErrorsNeverLeakQueryOrUserinfo(t *testing.T) {

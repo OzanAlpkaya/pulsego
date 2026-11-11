@@ -1,51 +1,327 @@
 # PulseGo
 
+[![CI](https://github.com/OzanAlpkaya/pulsego/actions/workflows/ci.yml/badge.svg)](https://github.com/OzanAlpkaya/pulsego/actions/workflows/ci.yml)
+
 Uptime monitoring platform in Go. Register HTTP/HTTPS endpoints; background
 workers check them on a schedule, record latency and availability, and open and
 resolve incidents when failures persist.
 
-Two binaries share one PostgreSQL-backed domain — `cmd/api` serves the REST API,
-`cmd/worker` runs the checks. PostgreSQL is both the store and the scheduler:
-workers claim due monitors with `FOR UPDATE SKIP LOCKED` and hold time-bounded
-leases, so several workers can run without double-processing and a crashed
-worker's monitors become reclaimable on their own.
+Two binaries share one PostgreSQL-backed domain — `cmd/api` serves the REST API
+and a read-only dashboard, `cmd/worker` runs the checks. PostgreSQL is both the
+store and the scheduler: workers claim due monitors with
+`FOR UPDATE SKIP LOCKED` and hold time-bounded leases, so several workers can
+run without double-processing and a crashed worker's monitors become
+reclaimable on their own.
 
-> **Status: Sprint 5 of 6 complete.** Monitors can be registered, workers
-> check them on a schedule behind SSRF protection, persistent failures open and
-> resolve incidents, and both binaries export Prometheus metrics and OTLP
-> traces. The dashboard and the full README (Sprint 6) are still to come. See
-> `ROADMAP.md` and `PROGRESS.md`.
+> **Status: all six sprints of `ROADMAP.md` are complete.** PulseGo is a
+> finished v1. `PROGRESS.md` records what each sprint delivered and why.
 
-## Quick start
+![Demo: a monitor goes down, an incident opens, the monitor recovers and the incident resolves](docs/demo.gif)
 
-Requires Go 1.26+ and Docker.
+## Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Tech choices](#tech-choices)
+- [Quick start with Docker Compose](#quick-start-with-docker-compose)
+- [Running locally without Compose](#running-locally-without-compose)
+- [Configuration](#configuration)
+- [API](#api)
+- [Monitor state and incidents](#monitor-state-and-incidents)
+- [Dashboard](#dashboard)
+- [Demo data](#demo-data)
+- [Workers and leases](#workers-and-leases)
+- [SSRF protection](#ssrf-protection)
+- [Observability](#observability)
+- [Testing](#testing)
+- [CI](#ci)
+- [Deployment notes](#deployment-notes)
+- [Layout](#layout)
+- [Database and migrations](#database-and-migrations)
+- [Key Engineering Decisions](#key-engineering-decisions)
+- [Known limitations](#known-limitations)
+- [Roadmap](#roadmap)
+- [Screenshots](#screenshots)
+- [CV-ready description](#cv-ready-description)
+
+## Features
+
+- **Monitor CRUD** over a REST API (`/v1/monitors`) with cursor pagination,
+  partial updates, soft delete and an OpenAPI 3.1 contract
+  (`api/openapi.yaml`) that a test keeps in sync with the router.
+- **Scheduled HTTP(S) checks** with per-monitor interval (10 s – 24 h),
+  timeout (100 ms – 60 s), expected status range and failure threshold.
+- **Check history** with status code, latency and a classified error kind
+  (`timeout`, `dns`, `connection`, `tls`, `redirect`, `unexpected_status`,
+  `blocked`, `unknown`). Response bodies are never stored.
+- **State machine and incidents:** `unknown → up / degraded → down`. An
+  incident opens when a monitor goes down and resolves when it recovers.
+- **Stats:** uptime percentage, average and p95 latency over 24 h, 7 d or
+  30 d.
+- **Horizontally scalable workers** that claim work with
+  `FOR UPDATE SKIP LOCKED` and recover abandoned work through leases.
+- **SSRF protection** for user-supplied URLs: at the API, at dial time, and on
+  every redirect.
+- **Retention:** check history older than `CHECK_RETENTION_DAYS` is deleted
+  in batches.
+- **Read-only dashboard** served by the api at `/`.
+- **Observability:** JSON logs (`log/slog`), Prometheus metrics with bounded
+  label cardinality, optional OpenTelemetry traces, and liveness and
+  readiness probes.
+- **Operations:** config validated at startup, graceful shutdown, a one-shot
+  migration job, non-root container images, and CI on every push.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    browser["Browser dashboard"]
+    client["API client, e.g. curl"]
+
+    subgraph apisvc["api - cmd/api"]
+        apipublic["Public listener :8080<br/>dashboard at / and REST API at /v1"]
+        apiinternal["Internal listener :9090<br/>/healthz, /readyz, /metrics"]
+    end
+
+    migrate["migrate - one-shot job<br/>goose migrations"]
+    pg[("PostgreSQL<br/>storage and scheduler")]
+
+    subgraph workersvc["worker - cmd/worker, one or more replicas"]
+        pool["Worker pool<br/>claim with FOR UPDATE SKIP LOCKED<br/>time-bounded lease"]
+        dialer["SSRF-guarded dialer"]
+        workerinternal["Internal listener :9090<br/>/healthz, /readyz, /metrics"]
+    end
+
+    targets["Monitored targets<br/>public HTTP and HTTPS endpoints"]
+
+    subgraph obs["Optional profile: observability"]
+        collector["otel-collector"]
+        jaeger["Jaeger"]
+        prom["Prometheus"]
+        grafana["Grafana"]
+    end
+
+    browser -->|"HTTP, same origin"| apipublic
+    client -->|"Bearer API key"| apipublic
+    apipublic -->|"SQL via sqlc and pgx"| pg
+    migrate -->|"applies schema, then exits"| pg
+    pool -->|"claim, record result, release lease"| pg
+    pool --> dialer
+    dialer -->|"GET, validated IPs only"| targets
+    prom -.->|"scrape"| apiinternal
+    prom -.->|"scrape"| workerinternal
+    grafana -.-> prom
+    apipublic -.->|"OTLP traces"| collector
+    pool -.->|"OTLP traces"| collector
+    collector -.-> jaeger
+```
+
+- The **api** is stateless. Its public listener (`HTTP_ADDR`, default `:8080`)
+  serves the dashboard and `/v1`; its internal listener (`INTERNAL_HTTP_ADDR`,
+  default `:9090`) serves the probes and metrics and should never be exposed
+  publicly.
+- The **worker** has no public listener, only the internal one.
+- **migrate** applies the embedded migrations and exits. Compose starts the
+  api and worker only after it succeeds.
+- Dotted lines are optional: traces flow only with `OTEL_ENABLED=true`, and
+  the four observability services start only with
+  `--profile observability`.
+
+## Tech choices
+
+| Area | Choice | Why |
+|---|---|---|
+| Language | Go (module requires 1.26.5+; CI builds with the latest 1.27.x) | One static binary per service, cheap concurrency for checks. |
+| HTTP | `net/http` + `go-chi/chi/v5` | Standard handlers; chi adds route patterns, which also serve as bounded metric labels. |
+| Database | PostgreSQL 17 + `jackc/pgx/v5` (`pgxpool`) | One dependency for storage *and* scheduling. |
+| SQL | `sqlc` | SQL stays visible in `db/queries`; no ORM. |
+| Migrations | `goose`, embedded in `cmd/migrate` | Plain SQL files, run as a one-shot job. |
+| Logs | `log/slog` JSON | Standard library, structured. |
+| Metrics | Prometheus Go client | Each binary has its own registry. |
+| Traces | OpenTelemetry, OTLP/HTTP export | Vendor-neutral and off by default. |
+| Tests | `testing`, `httptest`, Testcontainers-Go | Integration tests use a real PostgreSQL, never a mock. |
+| Packaging | Docker multi-stage build (Alpine runtime), Docker Compose | One Dockerfile builds all three images. |
+| CI | GitHub Actions, golangci-lint, govulncheck | Runs on every push and pull request. |
+| API contract | OpenAPI 3.1 (`api/openapi.yaml`) | A test checks it against the live router. |
+
+Developer tools (`sqlc`, `golangci-lint`, `govulncheck`) are pinned as go.mod
+`tool` directives. A bare checkout needs only Go and Docker.
+
+## Quick start with Docker Compose
+
+Requires Go 1.26.5+ (for `make bootstrap`) and Docker with Compose v2.
 
 ```bash
 make bootstrap   # download modules, verify tooling, create .env
 make up          # postgres + migrations + api + worker
 curl localhost:8080/healthz
-make down
+# dashboard: http://localhost:8080/  (API key: local-development-api-key)
+make down        # stop the stack and delete its volume
 ```
 
-Compose publishes the API on `8080`, the internal endpoints on `9090`, and
-PostgreSQL on `5434` (not 5432, so it does not collide with a database already
-running locally). Override with `API_PORT`, `API_INTERNAL_PORT`, and
-`POSTGRES_PORT`.
+`make up` runs `docker compose -f deployments/compose.yaml up --build -d`.
+Compose itself does not read the repository's `.env`: it fills each app
+setting in `deployments/compose.yaml` from the shell environment, or from its
+own default (`${VAR:-default}`). The Makefile supplies that environment. It
+reads `.env` (created by `make bootstrap` from `.env.example`) and exports
+every variable in it, so `API_KEY`, `ENVIRONMENT`, the worker settings and
+the rest come from `.env`.
+
+A value you set yourself wins over its `.env` line, whether it is already in
+the environment or given as a make argument:
+
+```bash
+LOG_LEVEL=debug make up    # environment beats .env
+make up LOG_LEVEL=debug    # so does a make argument
+```
+
+This holds for every variable and every target, not only `make up`.
+`DATABASE_URL`, `HTTP_ADDR` and `INTERNAL_HTTP_ADDR` are fixed in
+`deployments/compose.yaml`, so neither `.env` nor the environment changes
+them under Compose. The default API key is `local-development-api-key`; for
+anything beyond a laptop, set `API_KEY` in `.env` (`openssl rand -hex 32`).
+
+Compose publishes these host ports:
+
+| Port | What | Override |
+|---|---|---|
+| `8080` | api public listener: dashboard and `/v1` | `API_PORT` |
+| `9090` | api internal listener: `/healthz`, `/readyz`, `/metrics` | `API_INTERNAL_PORT` |
+| `5434` | PostgreSQL (not 5432, so it does not collide with a local database) | `POSTGRES_PORT` |
+
+The worker's internal port is not published; Prometheus reaches it inside the
+Compose network. `make logs` follows the api and worker logs.
+
+To run more than one worker, scale the service:
+
+```bash
+docker compose -f deployments/compose.yaml up -d --scale worker=3
+```
+
+Plain `docker compose` commands like this one do not go through the
+Makefile, so they do not get the variables it exports from `.env`. Export
+them yourself (`set -a; . ./.env; set +a`) if you changed any.
 
 ## Running locally without Compose
 
-```bash
-cp .env.example .env      # then set DATABASE_URL and API_KEY
-make migrate-up
-make run-api              # in one shell
-make run-worker           # in another
+You need Go and a PostgreSQL server (the project is developed and tested on
+PostgreSQL 17). The Makefile reads `.env` and exports
+every variable in it to `make run-api`, `make run-worker` and the
+`migrate-*` targets. As with `make up`, a variable already in the environment
+or passed as a make argument wins over `.env`.
+
+1. **Get a database.** Any PostgreSQL works. To borrow only the database from
+   Compose: `docker compose -f deployments/compose.yaml up -d postgres`, which
+   listens on `localhost:5434` with user, password and database `pulsego`.
+
+2. **Create `.env`** and point `DATABASE_URL` at that database:
+
+   ```bash
+   cp .env.example .env
+   # edit .env, for example:
+   # DATABASE_URL=postgres://pulsego:pulsego@localhost:5434/pulsego?sslmode=disable
+   ```
+
+   `.env.example` defaults to `localhost:5432`, a database you run yourself.
+   Its `API_KEY` (`local-development-api-key`) is fine for local use only.
+
+3. **Migrate, then start both services**, each in its own shell:
+
+   ```bash
+   make migrate-up
+   make run-api      # public :8080, internal :9090
+   make run-worker   # internal :9091
+   ```
+
+   `make run-worker` moves the worker's internal listener to `:9091`, so it
+   does not collide with the api's `:9090`. If `8080` or `9090` are taken on
+   your machine, change `HTTP_ADDR` and `INTERNAL_HTTP_ADDR` in `.env`, for
+   example `HTTP_ADDR=127.0.0.1:18080` and
+   `INTERNAL_HTTP_ADDR=127.0.0.1:19090`.
+
+4. **Check that it works:**
+
+   ```bash
+   curl localhost:8080/healthz    # {"status":"ok"}
+   curl localhost:9090/readyz     # {"status":"ready"}  (api, pings PostgreSQL)
+   curl localhost:9091/readyz     # {"status":"ready"}  (worker)
+   ```
+
+   Then create a monitor (see [API](#api)) or open http://localhost:8080/.
+
+`make migrate-status` shows the applied migrations. Stop the services with
+Ctrl-C; both drain in-flight work within `SHUTDOWN_TIMEOUT`.
+
+## Configuration
+
+Every variable is listed in `.env.example` and validated at startup by
+`internal/config`. An invalid configuration stops the process with every
+problem listed at once:
+
 ```
+api: config: API_KEY must be at least 16 characters
+config: DATABASE_URL is required
+config: WORKER_CONCURRENCY must be between 1 and 256, got 999
+```
+
+| Variable | Default | Allowed values | Purpose |
+|---|---|---|---|
+| `SERVICE_NAME` | `pulsego` | any | `service` field in logs; trace service names become `<name>-api` and `<name>-worker`. |
+| `ENVIRONMENT` | `development` | `development`, `staging`, `production` | Gates `ALLOW_PRIVATE_TARGETS`. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` | Minimum log level. |
+| `HTTP_ADDR` | `:8080` | listen address, must differ from `INTERNAL_HTTP_ADDR` | api public listener (dashboard and `/v1`). The worker ignores it. |
+| `INTERNAL_HTTP_ADDR` | `:9090` | listen address | `/healthz`, `/readyz`, `/metrics` for api and worker. |
+| `DATABASE_URL` | — (required) | `postgres://` or `postgresql://` URL | PostgreSQL connection. |
+| `API_KEY` | — (required) | at least 16 characters | Bearer token for `/v1`. Generate one with `openssl rand -hex 32`. |
+| `WORKER_CONCURRENCY` | `10` | 1–256 | Checks running at once per worker process. |
+| `WORKER_BATCH_SIZE` | `20` | 1–500 | Most monitors claimed per poll. |
+| `WORKER_POLL_INTERVAL` | `5s` | 1s–5m | Time between claims. |
+| `WORKER_LEASE_DURATION` | `60s` | 5s–10m, and greater than `DEFAULT_CHECK_TIMEOUT` | How long a claim is held. |
+| `DEFAULT_CHECK_INTERVAL` | `60s` | 10s–24h | Interval for new monitors that do not set one. |
+| `DEFAULT_CHECK_TIMEOUT` | `5s` | 100ms–60s | Timeout for new monitors that do not set one. |
+| `CHECK_RETENTION_DAYS` | `30` | 1–365 | Days of check history to keep. |
+| `ALLOW_PRIVATE_TARGETS` | `false` | `true` only with `ENVIRONMENT=development` | **Development only.** Turns off the SSRF address checks. |
+| `OTEL_ENABLED` | `false` | `true`, `false` | Export traces over OTLP/HTTP. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | full `http(s)://` URL; required when `OTEL_ENABLED=true` | Collector base URL, for example `http://localhost:4318`. |
+| `SHUTDOWN_TIMEOUT` | `15s` | 1s–2m | Budget for draining in-flight work after SIGTERM/SIGINT. |
+
+`PULSEGO_TEST_DATABASE_URL` is read only by the integration tests, never by
+the application (see [Testing](#testing)).
+
+Two rules are worth calling out:
+
+- `WORKER_LEASE_DURATION` must exceed `DEFAULT_CHECK_TIMEOUT`, otherwise a
+  second worker could reclaim a monitor while the first is still waiting on the
+  network.
+- `ALLOW_PRIVATE_TARGETS=true` is refused unless `ENVIRONMENT=development`. It
+  lets monitors point at loopback and private addresses, which turns the checker
+  into an SSRF gadget against your own network. See
+  [SSRF protection](#ssrf-protection).
 
 ## API
 
-Every `/v1` endpoint needs the API key; `/healthz` deliberately does not. The
-full contract is `api/openapi.yaml`, and a test walks the router against that
+Every `/v1` endpoint needs the API key as `Authorization: Bearer <key>`;
+`/healthz`, `/readyz` and the dashboard files deliberately do not. The full
+contract is `api/openapi.yaml`, and a test walks the router against that
 document so the two cannot drift apart.
+
+A monitor has these writable fields. Only `name` and `url` are required:
+
+| Field | Default | Range |
+|---|---|---|
+| `name` | — | 1–120 characters |
+| `url` | — | `http`/`https`, at most 2048 bytes, must pass the [SSRF policy](#ssrf-protection) |
+| `interval_seconds` | `DEFAULT_CHECK_INTERVAL` (60) | 10–86400 |
+| `timeout_ms` | `DEFAULT_CHECK_TIMEOUT` (5000) | 100–60000 |
+| `expected_status_min` / `expected_status_max` | 200 / 399 | 100–599 |
+| `failure_threshold` | 3 | 1–10 |
+| `enabled` | `true` | — |
+
+`timeout_ms` must be shorter than the interval, and `expected_status_min`
+must not exceed `expected_status_max`.
+
+List endpoints take `limit` (default 20, at most 100) and return
+`next_cursor` while there are more pages.
 
 ```bash
 KEY=local-development-api-key
@@ -202,26 +478,158 @@ once safely. Incidents are kept; their `opening_check_id` and
 30, the `30d` window covers only the retained days (and below 7, so does the
 `7d` window).
 
-## Configuration
+## Dashboard
 
-Every variable is documented in `.env.example` and validated at startup. An
-invalid configuration stops the process with every problem listed at once:
+The api serves a small read-only dashboard on its public listener. It is
+plain HTML, CSS and JavaScript embedded into the binary (`web/static`), with
+no build step and no third-party assets.
+
+1. Open http://localhost:8080/ (or your `HTTP_ADDR`).
+2. Enter the API key (`local-development-api-key` for the Compose defaults).
+
+It shows:
+
+- **Summary tiles:** how many monitors are up, down, degraded or unknown, and
+  the total.
+- **Monitors table:** name and target host, state, uptime and p95 latency over the
+  last 24 h, last check time, last status code and latency.
+- **Recent incidents:** open incidents first, then the most recently
+  resolved, with cause and duration.
+
+It refreshes every 10 seconds. Everything comes from the same `/v1`
+endpoints documented above, called from the browser. There is no separate
+dashboard backend and no way to change anything from it.
+
+The API key is kept in the tab's **`sessionStorage` only**. It is sent only
+in the `Authorization` header and never put into a URL, a cookie or
+`localStorage`. Closing the tab or clicking **Forget API key** drops it.
+The dashboard responses carry a strict same-origin Content Security Policy,
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+
+See [Screenshots](#screenshots) for what it looks like.
+
+## Demo data
+
+**Seed a running api** with four example monitors:
+
+```bash
+API_KEY=local-development-api-key make demo-seed   # runs scripts/seed-demo.sh
+```
+
+- `API_URL` defaults to `http://localhost:8080`.
+- Without `TARGET_BASE`, it seeds public endpoints (`example.com`,
+  `www.iana.org`, `httpbin.org/delay/1`, and `httpbin.org/status/503`). The
+  last one always fails, so within a minute it is `down` with an open
+  incident. These URLs pass the default SSRF policy, so this works against
+  the Compose stack as it is.
+- Re-running is safe: monitors whose name already exists are skipped.
+- If `.env` exists, the Makefile exports its `API_KEY`, so plain
+  `make demo-seed` works too. An `API_KEY` set on the command line wins.
+
+**Regenerate the screenshots and the GIF** with `make demo`
+(`scripts/demo.sh`).
+
+> [!WARNING]
+> **Local demo only, never production.** The demo targets listen on
+> `127.0.0.1`, so the api and worker need `ENVIRONMENT=development` and
+> `ALLOW_PRIVATE_TARGETS=true`, which turns SSRF protection off. No committed
+> file sets them — not the script, the Makefile, `.env.example`, Compose or
+> CI. You pass both on the command line every time.
+
+```bash
+ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true \
+  DATABASE_URL='postgres://pulsego:pulsego@localhost:5434/pulsego_demo?sslmode=disable' \
+  make demo
+```
+
+Make arguments work as well:
+`make demo ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true`. Either way
+they win over `.env`, and so does a `DATABASE_URL` given the same way;
+otherwise `DATABASE_URL` comes from `.env`.
+
+**Prerequisites:** Go, curl, ffmpeg, Chromium or Chrome on `PATH`, and an
+empty, throwaway PostgreSQL database in `DATABASE_URL` (create it first,
+for example `pulsego_demo` above). The script migrates it. A re-run reuses
+the seeded monitors, so earlier incidents stay on the dashboard; use a fresh
+database for clean screenshots.
+
+**What it does:**
+
+- Builds and starts its own api, worker and local demo targets
+  (`demo/cmd/targets`) on `127.0.0.1:18080`, `:18082`, `:19090` and `:19091`.
+  The api and worker inherit `ENVIRONMENT` and `ALLOW_PRIVATE_TARGETS` from
+  your command unchanged.
+- Seeds four monitors against those targets with a random API key (never
+  printed), through `scripts/seed-demo.sh`.
+- Collects 60 s of check history (`DEMO_WARMUP`), then drives the
+  "Payments webhook" target down until an incident opens, and back up until
+  it resolves.
+- Takes a few minutes in total: the build, the 60 s warm-up and the incident
+  cycle. The capture step gives up after 6 minutes.
+- Writes `docs/screenshots/dashboard.png`, `incident-open.png`,
+  `incident-resolved.png` and `docs/demo.gif`, then stops everything it
+  started.
+
+**Refusal.** Without both variables, the script exits with status 2 before
+it builds or starts anything (under `make`, make then reports `Error 2`).
+The same happens if `.env` sets `ALLOW_PRIVATE_TARGETS=false`, as
+`.env.example` does, and you pass nothing on the command line:
 
 ```
-api: config: API_KEY must be at least 16 characters
-config: DATABASE_URL is required
-config: WORKER_CONCURRENCY must be between 1 and 256, got 999
+demo: refusing to start: the demo needs ENVIRONMENT=development and
+ALLOW_PRIVATE_TARGETS=true in the environment, got:
+  ENVIRONMENT=<unset>
+  ALLOW_PRIVATE_TARGETS=<unset>
+Together they turn SSRF protection off so the api and worker can check the
+demo targets on 127.0.0.1.
+
+Run it as (local demo only, never in production):
+
+  ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true make demo
 ```
 
-Two rules are worth calling out:
+Never copy `ALLOW_PRIVATE_TARGETS=true` into `.env`, Compose or a
+deployment. The other `DEMO_*` settings (addresses, GIF size and frame
+rate) are listed at the top of `scripts/demo.sh`.
 
-- `WORKER_LEASE_DURATION` must exceed `DEFAULT_CHECK_TIMEOUT`, otherwise a
-  second worker could reclaim a monitor while the first is still waiting on the
-  network.
-- `ALLOW_PRIVATE_TARGETS=true` is refused unless `ENVIRONMENT=development`. It
-  lets monitors point at loopback and private addresses, which turns the checker
-  into an SSRF gadget against your own network. See
-  [SSRF protection](#ssrf-protection).
+The capture tool lives in a nested Go module (`demo/`), so chromedp never
+enters the main module, its tests or its vulnerability scan.
+
+## Workers and leases
+
+Each worker process runs one poll loop and a pool of at most
+`WORKER_CONCURRENCY` checks:
+
+1. **Claim.** Every `WORKER_POLL_INTERVAL`, the worker runs one SQL statement
+   (`ClaimDueMonitors` in `db/queries/checks.sql`). It selects enabled,
+   non-deleted monitors with `next_check_at <= now()` and no live lease,
+   with `FOR UPDATE SKIP LOCKED`. It then sets `lease_owner` to the worker ID
+   and `lease_until` to `now() + GREATEST(WORKER_LEASE_DURATION, monitor
+   timeout + 5s)`. It never asks for more monitors than it has free slots
+   (and at most `WORKER_BATCH_SIZE`). The lease commits before any network
+   call, and every timestamp is PostgreSQL's `now()`, so clock skew between
+   workers does not matter.
+2. **Check.** Each claimed monitor gets a GET through the SSRF-guarded
+   client, bounded by the monitor's timeout. The body is drained (at most
+   64 KiB) and discarded, never stored.
+3. **Record.** One transaction locks the monitor row *only if this worker
+   still holds the lease*. It inserts the check, applies the state
+   transition, opens or resolves an incident, reschedules `next_check_at`
+   and clears the lease. If the lease was lost (it expired and another
+   worker took it, or the monitor was deleted), the late result is discarded.
+4. **Shutdown.** On SIGTERM/SIGINT the worker stops claiming. In-flight
+   checks get `SHUTDOWN_TIMEOUT` to finish; the ones still running are
+   cancelled and their leases released without a result, so the monitors
+   stay due and are picked up again at once.
+
+The worker ID is `<hostname>-<uuid>`, so a lease in the database can be
+traced back to one process, and two restarts of one container stay distinct.
+
+If a worker crashes mid-check, nothing releases its leases. They simply
+expire at `lease_until`, and the next claim by any worker picks those
+monitors up. A manual `POST /v1/monitors/{id}/checks` sets `next_check_at` to
+now, and a result recorded afterwards keeps that time instead of
+rescheduling over it.
 
 ## SSRF protection
 
@@ -234,7 +642,10 @@ request forgery:
   CGNAT (`100.64/10`), link-local (`169.254/16` — including the
   `169.254.169.254` cloud metadata endpoint — and `fe80::/10`), multicast,
   broadcast and reserved ranges, documentation and benchmarking ranges, IPv6
-  ULA and site-local, NAT64, 6to4 and Teredo. IPv4-mapped IPv6 addresses
+  ULA and site-local, NAT64, 6to4 and Teredo. Three IPv6 special-use ranges
+  are blocked as well: `::/96` (IPv4-compatible, deprecated), `100::/64`
+  (discard-only) and `2001:10::/28` (ORCHID, deprecated); `::` and `::1`
+  still report "unspecified" and "loopback". IPv4-mapped IPv6 addresses
   (`::ffff:127.0.0.1`) are unmapped first. `localhost`, `*.localhost`,
   ambiguous numeric hosts (`127.1`, `2130706433`, `0x7f.0.0.1`), IPv6 zone
   identifiers and URLs with credentials are rejected too.
@@ -253,12 +664,24 @@ request forgery:
 - A refused check is stored with `error_kind` `blocked`. Stored error messages
   never contain the URL or its query string.
 
+The full list, with the reason reported for each range, is
+`blockedRanges` in `internal/security/policy.go`.
+
+### `ALLOW_PRIVATE_TARGETS` is for local development only
+
 `ALLOW_PRIVATE_TARGETS=true` turns the address, `localhost` and port checks
 off (resolve-then-dial-the-IP still applies). It exists so you can monitor a
 service on your own machine during development, and the config refuses it
-outside `ENVIRONMENT=development`: with it on, anyone holding the API key can
-make the worker reach internal services, admin ports and cloud metadata
-credentials from inside your network, and read back status codes and timings.
+outside `ENVIRONMENT=development`.
+
+The risk is real even on a "development" box that is reachable from a
+network. With it on, anyone holding the API key can make the worker reach
+internal services, admin ports and cloud metadata credentials
+(`169.254.169.254`) from inside your network. They can then read back status
+codes, timings and error kinds through the check history. Keep it `false` in
+`.env`, in Compose and in every deployed environment. `scripts/demo.sh` never
+sets it: you pass it on the command line for a local demo run, and the script
+refuses to start without it (see [Demo data](#demo-data)).
 
 ## Observability
 
@@ -370,34 +793,47 @@ OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
   docker compose -f deployments/compose.yaml --profile observability up --build
 ```
 
-## Development
+## Testing
 
 ```bash
-make test              # unit tests, race detector
-make test-integration  # Testcontainers (Docker), or PULSEGO_TEST_DATABASE_URL
+make test              # unit tests with the race detector: go test -race ./...
+make test-integration  # integration tests (build tag "integration"), race detector on
 make lint              # golangci-lint
+make vet               # go vet
 make vuln              # govulncheck
 make sqlc              # regenerate query code after editing db/queries
-make build             # binaries into bin/
+make build             # api, worker and migrate binaries into bin/
 ```
 
-Integration tests start PostgreSQL containers through Testcontainers by
-default. To run them without Docker, point `PULSEGO_TEST_DATABASE_URL` at an
-existing PostgreSQL server whose role has the `CREATEDB` privilege:
+**Unit tests** need no database and no Docker. They cover config validation,
+the state machine, error classification, the SSRF policy and dialer, stats
+maths, cursors, the dashboard handlers and every HTTP handler via `httptest`.
+A test also checks the router against `api/openapi.yaml`.
 
-```bash
-PULSEGO_TEST_DATABASE_URL='postgres://user:pass@localhost:5432/postgres?sslmode=disable' \
-  make test-integration
-```
+**Integration tests** (`//go:build integration`) run against a real
+PostgreSQL. They cover migrations up and down, constraints, concurrent
+`SKIP LOCKED` claims, lease expiry and reclaim, the check-result
+transaction, incidents, pagination, stats and retention. They find a database
+in one of two ways:
 
-The suite never writes to the database in that URL. It creates its own
-`pulsego_test_<random>` databases on the server, one per pristine-schema test
-plus one shared database, and drops each with `DROP DATABASE … WITH (FORCE)`
-when it is done. The application itself never reads this variable.
+- **Testcontainers (default).** With `PULSEGO_TEST_DATABASE_URL` unset, the
+  suite starts PostgreSQL containers through Docker. This is what CI does.
+- **An existing server, no Docker.** Point `PULSEGO_TEST_DATABASE_URL` at a
+  PostgreSQL server whose role has the `CREATEDB` privilege:
 
-Developer tools (`sqlc`, `golangci-lint`, `govulncheck`) are pinned as go.mod
-`tool` directives, so a bare checkout needs nothing installed beyond Go and
-Docker.
+  ```bash
+  PULSEGO_TEST_DATABASE_URL='postgres://user:pass@localhost:5432/postgres?sslmode=disable' \
+    make test-integration
+  ```
+
+  The suite never writes to the database in that URL. It creates its own
+  `pulsego_test_<random>` databases on the server, one per pristine-schema
+  test plus one shared database, and drops each with
+  `DROP DATABASE … WITH (FORCE)` when it is done. The application itself
+  never reads this variable.
+
+The demo tooling is a separate Go module; test it with
+`cd demo && go test ./...`.
 
 ## CI
 
@@ -411,17 +847,60 @@ Docker.
   against PostgreSQL and waits for both health checks to pass. It then checks
   that the containers run as non-root and that `/readyz` returns 200.
 
+The badge at the top of this file shows the latest result.
+
+## Deployment notes
+
+PulseGo has not been run in production; these notes follow from how it is
+built.
+
+- **Images.** `make docker-build` builds `pulsego-api:local`,
+  `pulsego-worker:local` and `pulsego-migrate:local` from one
+  `deployments/Dockerfile` (`--build-arg BINARY=…`). The runtime is Alpine
+  with CA certificates, running as uid `10001`. The image `HEALTHCHECK` calls
+  `http://127.0.0.1:9090/healthz`, so keep `INTERNAL_HTTP_ADDR` on port
+  `9090` inside containers, or override the health check.
+- **Order.** Run `migrate up` to completion before rolling out a new api or
+  worker version. The services never migrate themselves.
+- **Configuration.** Set `ENVIRONMENT=production` (or `staging`), a random
+  `API_KEY` of at least 16 characters (`openssl rand -hex 32`), and leave
+  `ALLOW_PRIVATE_TARGETS=false`; the config refuses `true` outside
+  development anyway. Never commit `.env`.
+- **Network.** The api speaks plain HTTP; put TLS in front of it with a
+  reverse proxy or load balancer. Expose only the public listener
+  (`HTTP_ADDR`). Keep `INTERNAL_HTTP_ADDR` (probes and metrics) reachable
+  only by your orchestrator and Prometheus.
+- **Probes.** Use `/healthz` for liveness and `/readyz` for readiness.
+- **Scaling.** The api is stateless; run as many replicas as you like behind
+  a load balancer. Workers scale horizontally too: add replicas and they
+  split due monitors through `SKIP LOCKED`. Each process opens up to
+  `max(10, WORKER_CONCURRENCY + 2)` PostgreSQL connections; size
+  `max_connections` for the sum of all replicas.
+- **Shutdown.** Both binaries drain on SIGTERM within `SHUTDOWN_TIMEOUT`
+  (default 15 s). Give your orchestrator a longer grace period than that.
+- **Egress.** Workers need outbound HTTP(S) to the monitored targets and
+  DNS. They need no inbound traffic except the internal listener.
+
 ## Layout
 
 ```
 cmd/{api,worker,migrate}   service entry points; migrate is a one-shot job
 internal/config            env loading and validation
-internal/domain            core types and limits
-internal/httpapi           routing, middleware, handlers
+internal/domain            core types, limits and the state machine
+internal/httpapi           routing, middleware, handlers, dashboard routes
+internal/monitor           monitor service and validation
+internal/checker           the HTTP check and error classification
+internal/scheduler         claim loop, leases, retention
+internal/security          SSRF policy, guarded dialer, redirect policy
 internal/repository        pgxpool setup + sqlc-generated queries
-internal/{monitor,checker,scheduler,security,telemetry}
+internal/telemetry         logging, Prometheus metrics, tracing
 db/{migrations,queries}    goose migrations, sqlc query sources
+api/openapi.yaml           OpenAPI 3.1 contract
+web/static                 dashboard HTML, CSS and JavaScript (embedded)
 deployments/               Dockerfile, Compose stack, Prometheus/OTel/Grafana config
+scripts/                   seed-demo.sh, demo.sh
+demo/                      separate Go module: demo targets and screenshot capture
+docs/                      screenshots and demo GIF
 ```
 
 No ORM: the SQL lives in `db/queries` and `sqlc` compiles it into type-safe Go.
@@ -438,3 +917,165 @@ make migrate-up
 make migrate-status
 make migrate-down     # rolls back one migration
 ```
+
+Three tables hold everything:
+
+- **`monitors`**: the definition plus scheduling state (`next_check_at`,
+  `lease_owner`, `lease_until`) and current state.
+- **`monitor_checks`**: one row per check.
+- **`incidents`**: at most one unresolved incident per monitor, enforced by a
+  partial unique index.
+
+## Key Engineering Decisions
+
+### Why PostgreSQL is both storage and scheduler
+
+A check is due when `next_check_at <= now()`. That fact already lives in the
+`monitors` row, so the database *is* the queue. Claiming, recording a result
+and rescheduling happen in the same place as the data they change. A crash
+can therefore never leave a queue and a table disagreeing. One dependency
+also means one thing to back up, monitor and reason about. The partial
+index on `(enabled, next_check_at) WHERE deleted_at IS NULL` keeps the claim
+query cheap.
+
+### Why `SKIP LOCKED` enables multiple workers
+
+The claim runs `SELECT … FOR UPDATE SKIP LOCKED` inside an `UPDATE` that
+writes the lease. When two workers claim at the same moment, each one skips
+the rows the other has already locked instead of waiting on them. So they
+get **disjoint** batches in one round trip, with no blocking and no retry
+loop. Adding a worker adds throughput; nothing has to coordinate them. An
+integration test runs concurrent claims and asserts that no monitor is
+claimed twice.
+
+### Why Redis was intentionally omitted
+
+Redis (or Kafka, NATS…) would add a second source of truth for "what is
+due" that has to be kept consistent with PostgreSQL. It would also add a
+service to run and secure, and a failure mode where the two disagree. At
+this scale, PostgreSQL row locks give the same exclusive-claim guarantee,
+transactionally with the data. The project's non-goals rule out extra
+infrastructure until a measured bottleneck justifies it.
+
+### How leases recover abandoned jobs
+
+A claim sets `lease_owner` and `lease_until`, and commits *before* any network
+call. A monitor with a live lease is invisible to other claims. A healthy
+worker clears its lease when it records the result. A worker that crashes
+never does, so its lease simply runs out, and the next claim by any worker
+picks the monitor up. No heartbeat or janitor process is needed.
+
+Three details keep this safe:
+
+- The lease is at least the monitor's timeout plus 5 s, and the config
+  requires `WORKER_LEASE_DURATION > DEFAULT_CHECK_TIMEOUT`. A slow check is
+  therefore not reclaimed while it is still running.
+- Recording a result requires that this worker still holds the lease. A late
+  result from a worker whose lease was reclaimed is discarded, not applied
+  twice.
+- All lease times come from PostgreSQL's `now()`, so worker clocks do not
+  matter.
+
+### How SSRF protection works
+
+Monitors make the server fetch URLs chosen by API clients. The protection
+works in layers:
+
+1. The API checks the URL statically (scheme, host, port 80/443, blocked
+   ranges, no credentials) without DNS.
+2. At check time the dialer resolves the host once, rejects it if *any*
+   address is blocked, and dials only the validated IP. A DNS-rebinding
+   second lookup cannot happen.
+3. The socket address is checked again just before `connect`.
+4. Every redirect hop goes through the same checks, and there are at most 5.
+
+Blocked checks are stored as `error_kind: blocked`, without the URL. See
+[SSRF protection](#ssrf-protection) for the full list.
+
+### How metric cardinality is controlled
+
+Every label value comes from a closed set:
+
+- HTTP method (else `OTHER`);
+- chi route **pattern**, not path (else `unmatched`);
+- 3-digit status code;
+- domain enums for result, error kind and state (else `unknown`);
+- sqlc query names for database operations (else `other`).
+
+URLs, monitor IDs, worker IDs, error messages and request IDs are never
+labels. The `telemetry` package normalises every value itself, so a caller
+cannot add an unbounded label by mistake. The series count therefore does
+not grow with the number of monitors or requests.
+
+## Known limitations
+
+- **One shared API key.** There are no users, roles or tenants; everyone with
+  the key can read and change every monitor. The dashboard asks for that same
+  key.
+- **HTTP(S) GET only.** There are no other methods, no request bodies or
+  headers, no response-body assertions, and only ports 80 and 443. TCP, ICMP
+  and browser checks are not supported.
+- **No notifications.** Incidents are visible through the API and the
+  dashboard only; nothing sends email, chat or webhooks.
+- **Single region.** All workers check from wherever they run, so a network
+  problem near the workers looks like an outage.
+- **No TLS in the binary.** Terminate TLS in front of the api.
+- **Retention limits stats.** Stats see retained checks only. With
+  `CHECK_RETENTION_DAYS` below 30, the `30d` window covers only the retained
+  days (below 7, so does `7d`). Incidents are kept forever.
+- **Dashboard scale.** The dashboard loads at most 1,000 monitors (10 pages of
+  100), and requests stats and incidents per monitor every 10 s. It is meant
+  for small installations.
+- **Private targets.** Internal services cannot be monitored outside
+  development, by design.
+
+## Roadmap
+
+All six sprints in `ROADMAP.md` are done:
+
+| Sprint | Scope | Status |
+|---|---|---|
+| 1 — Foundation | Layout, config, logging, graceful shutdown, Compose, first migration | Done |
+| 2 — Monitor API | CRUD, validation, problem+json, API key, OpenAPI | Done |
+| 3 — Scheduler and Checker | `SKIP LOCKED` claims, leases, HTTP checks, check history | Done |
+| 4 — State and Incidents | State machine, incidents, stats, retention | Done |
+| 5 — Production Hardening | SSRF protection, metrics, tracing, readiness, CI | Done |
+| 6 — Portfolio Polish | Dashboard, demo tooling, screenshots, this README | Done |
+
+Possible future work, all outside v1 scope:
+
+- **Webhook notifications** on incident open and resolve (the only
+  stretch feature `ROADMAP.md` names).
+- Per-monitor request headers and response-body assertions.
+- Scoped or multiple API keys.
+
+The v1 non-goals still apply: no Kubernetes, Kafka/NATS, Redis,
+microservices, SMS/email delivery, multi-tenant authorization, billing,
+mobile app, browser/synthetic journeys or regional worker clusters.
+
+## Screenshots
+
+Generated by `make demo` against local demo targets (see
+[Demo data](#demo-data)).
+
+**Dashboard** — summary, monitors with 24 h uptime and p95, recent incidents:
+
+![PulseGo dashboard with several monitors up and their uptime and latency](docs/screenshots/dashboard.png)
+
+**Incident open** — a monitor is down and its incident is open:
+
+![Dashboard showing a monitor down with an open incident](docs/screenshots/incident-open.png)
+
+**Incident resolved** — the monitor recovered and the incident closed:
+
+![Dashboard showing the monitor back up and the incident resolved](docs/screenshots/incident-resolved.png)
+
+**Demo** — the full cycle as a GIF: [`docs/demo.gif`](docs/demo.gif).
+
+## CV-ready description
+
+> Built a production-oriented uptime monitoring platform in Go using
+> PostgreSQL, type-safe SQL, horizontally scalable background workers,
+> lease-based job scheduling, OpenTelemetry, Prometheus, integration tests,
+> Docker, and CI/CD. Implemented incident lifecycle management, graceful
+> shutdown, and SSRF protection for user-supplied monitoring targets.

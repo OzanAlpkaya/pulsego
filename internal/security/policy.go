@@ -156,6 +156,10 @@ var blockedRanges = func() []blockedRange {
 		{"::/128", "unspecified address"},
 		{"127.0.0.0/8", "loopback address"},
 		{"::1/128", "loopback address"},
+		// Must stay after ::/128 and ::1/128: the first match wins.
+		{"::/96", "IPv4-compatible IPv6 address (deprecated)"},
+		{"100::/64", "discard-only address"},
+		{"2001:10::/28", "ORCHID address (deprecated)"},
 		{"10.0.0.0/8", "private address"},
 		{"172.16.0.0/12", "private address"},
 		{"192.168.0.0/16", "private address"},
@@ -188,7 +192,8 @@ var blockedRanges = func() []blockedRange {
 
 // BlockedReason reports whether addr is in a range outbound checks must never
 // reach, and why. IPv4-mapped IPv6 addresses are unmapped and zones dropped
-// before matching; an invalid address is blocked.
+// before matching; an invalid address is blocked. Ranges are matched in table
+// order and the first match supplies the reason.
 func BlockedReason(addr netip.Addr) (reason string, isBlocked bool) {
 	if !addr.IsValid() {
 		return "invalid address", true

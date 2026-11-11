@@ -93,6 +93,10 @@ func TestDialerRejectsPrivateAnswer(t *testing.T) {
 		{"meta.example", "169.254.169.254"},
 		{"mapped.example", "::ffff:127.0.0.1"},
 		{"ula.example", "fd00::1"},
+		{"compat.example", "::7f00:1"},
+		{"compat-private.example", "::a00:1"},
+		{"discard.example", "100::1"},
+		{"orchid.example", "2001:10::1"},
 		{"localhost", "127.0.0.1"},
 	}
 	for _, tc := range tests {

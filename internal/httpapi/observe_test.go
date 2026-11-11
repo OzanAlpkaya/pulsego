@@ -49,6 +49,11 @@ func TestObserveRecordsRouteTemplates(t *testing.T) {
 		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/monitors/"+testMonitorID, nil), // 401
 		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/wp-admin/"+testMonitorID+".php", nil),
 		httptest.NewRequestWithContext(t.Context(), "PROPFIND", "/healthz", nil),
+		// Dashboard files share one template whichever file is asked for.
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/static/app.js", nil),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/static/style.css", nil),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/static/"+testMonitorID+".js", nil),
 	}
 	for _, req := range requests {
 		router.ServeHTTP(httptest.NewRecorder(), req)
@@ -64,6 +69,9 @@ func TestObserveRecordsRouteTemplates(t *testing.T) {
 		// the /v1 mount: still a template, and one series for every 401.
 		`pulsego_http_requests_total{code="401",method="GET",route="/v1/*"} 1`,
 		`pulsego_http_requests_total{code="404",method="GET",route="unmatched"} 1`,
+		`pulsego_http_requests_total{code="200",method="GET",route="/"} 1`,
+		`pulsego_http_requests_total{code="200",method="GET",route="/static/*"} 2`,
+		`pulsego_http_requests_total{code="404",method="GET",route="/static/*"} 1`,
 		`pulsego_http_requests_total{code="405",method="OTHER",route="unmatched"} 1`,
 		`pulsego_http_request_duration_seconds_count{method="GET",route="/v1/monitors/{monitorID}"} 1`,
 	} {

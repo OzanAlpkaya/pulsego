@@ -83,7 +83,7 @@ func documentedOperations(t *testing.T, doc openAPIDoc) []string {
 
 // implementedOperations walks the real router. HEAD routes are excluded: they
 // are an implementation detail of the probes and are not part of the documented
-// API surface.
+// API surface. So are the dashboard routes, / and /static/*.
 func implementedOperations(t *testing.T) []string {
 	t.Helper()
 
@@ -95,6 +95,11 @@ func implementedOperations(t *testing.T) []string {
 	var ops []string
 	err := chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		if method == http.MethodHead {
+			return nil
+		}
+		// The dashboard's page and static files are not API operations: they
+		// carry no data and are not part of the contract clients code against.
+		if route == "/" || route == "/static/*" {
 			return nil
 		}
 		// chi renders a mounted sub-router's index as a trailing slash; the

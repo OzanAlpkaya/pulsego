@@ -9,6 +9,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/OzanAlpkaya/pulsego/web"
 )
 
 // RouterConfig carries what the public router needs to be built.
@@ -42,6 +44,16 @@ func NewRouter(cfg RouterConfig, log *slog.Logger) http.Handler {
 	r.Head("/healthz", Healthz)
 	r.Get("/readyz", Readyz(cfg.Pinger, log))
 	r.Head("/readyz", Readyz(cfg.Pinger, log))
+
+	// The dashboard is public because it carries no data: the page asks for
+	// the API key and calls /v1 from the browser. Both patterns are fixed, so
+	// they keep the route label bounded.
+	static := web.Static()
+	r.Group(func(dash chi.Router) {
+		dash.Use(dashboardHeaders)
+		dash.Get("/", dashboardIndex(static))
+		dash.Get("/static/*", dashboardStatic(static))
+	})
 
 	r.Route("/v1", func(v1 chi.Router) {
 		v1.Use(APIKeyAuth(cfg.APIKey, log))

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>PulseGo — Dashboard</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-mark" src="/static/favicon.svg" alt="" width="28" height="28">
+      <div>
+        <h1>PulseGo</h1>
+        <p class="tagline">Uptime monitoring · read-only dashboard</p>
+      </div>
+    </div>
+    <div class="topbar-meta" id="meta" hidden>
+      <span class="refresh-dot" id="refresh-dot" aria-hidden="true"></span>
+      <span id="updated-at">Loading…</span>
+      <button type="button" class="link-button" id="sign-out">Forget API key</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="key-panel" id="key-panel" hidden>
+      <h2>Enter your API key</h2>
+      <p class="muted">The key is kept in this browser tab only (sessionStorage) and sent as a bearer token to the <code>/v1</code> API.</p>
+      <form id="key-form" method="post" autocomplete="off">
+        <label for="key-input">API key</label>
+        <div class="key-row">
+          <input id="key-input" name="api-key" type="password" required spellcheck="false" autocomplete="off">
+          <button type="submit">Open dashboard</button>
+        </div>
+        <p class="form-error" id="key-error" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <div id="dashboard" hidden>
+      <p class="banner banner-error" id="error-banner" role="alert" hidden></p>
+
+      <section class="summary" aria-label="Summary">
+        <div class="stat stat-up"><span class="stat-value" id="count-up">–</span><span class="stat-label">Up</span></div>
+        <div class="stat stat-down"><span class="stat-value" id="count-down">–</span><span class="stat-label">Down</span></div>
+        <div class="stat stat-other"><span class="stat-value" id="count-other">–</span><span class="stat-label">Degraded / unknown</span></div>
+        <div class="stat stat-total"><span class="stat-value" id="count-total">–</span><span class="stat-label">Monitors</span></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Monitors</h2>
+          <span class="muted small">Uptime and p95 latency over the last 24 h</span>
+        </div>
+        <p class="placeholder" id="monitors-loading">Loading monitors…</p>
+        <p class="placeholder" id="monitors-empty" hidden>No monitors yet. Create one with <code>POST /v1/monitors</code>.</p>
+        <div class="table-wrap">
+          <table id="monitors-table" hidden>
+            <thead>
+              <tr>
+                <th scope="col">Monitor</th>
+                <th scope="col">State</th>
+                <th scope="col" class="num">Uptime 24h</th>
+                <th scope="col" class="num">p95 24h</th>
+                <th scope="col">Last check</th>
+                <th scope="col" class="num">Status</th>
+                <th scope="col" class="num">Latency</th>
+              </tr>
+            </thead>
+            <tbody id="monitors-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Recent incidents</h2>
+          <span class="muted small">Open first, then the most recently resolved</span>
+        </div>
+        <p class="placeholder" id="incidents-loading">Loading incidents…</p>
+        <p class="placeholder" id="incidents-empty" hidden>No incidents. Everything has stayed up.</p>
+        <div class="table-wrap">
+          <table id="incidents-table" hidden>
+            <thead>
+              <tr>
+                <th scope="col">Monitor</th>
+                <th scope="col">Status</th>
+                <th scope="col">Started</th>
+                <th scope="col">Resolved</th>
+                <th scope="col" class="num">Duration</th>
+                <th scope="col">Cause</th>
+              </tr>
+            </thead>
+            <tbody id="incidents-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="footer muted small">Refreshes every 10 seconds · data from the PulseGo <code>/v1</code> API</footer>
+</body>
+</html>

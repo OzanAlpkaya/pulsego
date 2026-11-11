@@ -5,15 +5,23 @@ COMPOSE := docker compose -f deployments/compose.yaml
 GO      := go
 
 # Local runs read .env if it exists; Compose supplies its own environment.
+# A variable already set in the environment (`VAR=value make ...`) wins over
+# its .env line, as do make arguments (`make ... VAR=value`), so a one-off
+# value on the command line is never silently replaced by .env. Environment
+# values are saved before the include and restored, unexpanded, after it.
 ifneq (,$(wildcard .env))
+DOTENV_KEYS := $(shell sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\1/p' .env)
+DOTENV_FROM_ENV := $(foreach v,$(DOTENV_KEYS),$(if $(filter environment,$(origin $(v))),$(v)))
+$(foreach v,$(DOTENV_FROM_ENV),$(eval DOTENV_SAVED_$(v) := $$(value $(v))))
 include .env
+$(foreach v,$(DOTENV_FROM_ENV),$(eval $(v) := $$(DOTENV_SAVED_$(v))))
 export
 endif
 
 .DEFAULT_GOAL := help
 .PHONY: help bootstrap up down logs migrate-up migrate-down migrate-status \
         sqlc run-api run-worker test test-integration lint fmt vet vuln build \
-        docker-build clean
+        docker-build clean demo-seed demo
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -86,6 +94,21 @@ docker-build: ## Build all three container images
 	docker build --build-arg BINARY=api     -t pulsego-api:local     -f deployments/Dockerfile .
 	docker build --build-arg BINARY=worker  -t pulsego-worker:local  -f deployments/Dockerfile .
 	docker build --build-arg BINARY=migrate -t pulsego-migrate:local -f deployments/Dockerfile .
+
+# Seeds demo monitors into a running api (API_KEY required; API_URL defaults to
+# http://localhost:8080; TARGET_BASE points at demo/cmd/targets, else public
+# endpoints are used). Re-runs skip monitors that already exist.
+demo-seed: ## Seed demo monitors into a running api (API_KEY, API_URL, TARGET_BASE)
+	scripts/seed-demo.sh
+
+# Local development only: starts its own api and worker against DATABASE_URL
+# and rewrites docs/screenshots/*.png and docs/demo.gif. The demo targets are
+# on 127.0.0.1, so the caller opts out of SSRF protection explicitly; this
+# target never does it for you, and scripts/demo.sh refuses to start without
+# both variables:
+#   ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true make demo
+demo: ## Regenerate screenshots and demo GIF; caller passes ENVIRONMENT=development ALLOW_PRIVATE_TARGETS=true (local only)
+	scripts/demo.sh
 
 clean: ## Remove build artefacts
 	rm -rf bin coverage.out
